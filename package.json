@@ -1,0 +1,43 @@
+{
+  "name": "aligns-gate",
+  "version": "1.2.0",
+  "description": "Zero-dependency OpenCode plugin for role-scoped ALIGNS.md audit windows, post-audit context dehydration, monolith auto-split baton, and orchestrator write guard.",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./server": "./index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "README.md",
+    "LICENSE",
+    "examples/ALIGNS.example.md"
+  ],
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ukiyo-dev/aligns-gate.git"
+  },
+  "homepage": "https://github.com/ukiyo-dev/aligns-gate#readme",
+  "bugs": {
+    "url": "https://github.com/ukiyo-dev/aligns-gate/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "aligns",
+    "orchestrator",
+    "subagent",
+    "audit-gate",
+    "context-dehydration",
+    "monolith-split"
+  ],
+  "author": "ukiyo-dev",
+  "license": "MIT"
+}
