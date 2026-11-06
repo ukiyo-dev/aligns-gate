@@ -1,7 +1,7 @@
 {
   "name": "aligns-gate",
   "version": "1.2.0",
-  "description": "Zero-dependency OpenCode plugin for role-scoped ALIGNS.md audit windows, post-audit context dehydration, monolith auto-split baton, and orchestrator write guard.",
+  "description": "DeepSeek Super-agent inspired OpenCode harness plugin: Router/Worker write guard, event-driven ALIGNS.md audit windows, post-review context dehydration, and idle watchdog monolith splitting.",
   "type": "module",
   "main": "./index.mjs",
   "exports": {
@@ -31,12 +31,12 @@
   "keywords": [
     "opencode",
     "opencode-plugin",
+    "deepseek",
+    "super-agent",
+    "agent-harness",
     "aligns",
     "orchestrator",
-    "subagent",
-    "audit-gate",
-    "context-dehydration",
-    "monolith-split"
+    "subagent"
   ],
   "author": "ukiyo-dev",
   "license": "MIT"
