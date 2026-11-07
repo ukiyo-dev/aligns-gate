@@ -133,7 +133,7 @@ test("mid-flight user updates defer background audits without consuming a redisp
       assert.equal(sent.length, 0);
       assert.equal(applyMandateGateToV2Event({ messages }, dir), true);
       const reminder = messages.at(-1).content[0].text;
-      assert.match(reminder, /\[ALIGNS\.md — 派发 @aligner 独立审稿 · 1\/2\]/);
+      assert.match(reminder, /\[ALIGNS\.md — 派发 @aligner 独立审稿 · 1\/5\]/);
       assert.ok(reminder.includes('- 若用户最新消息有待补发的改动需求：请直接调用 `subagent(agent="designer", sessionID="ses_bg_pre")` 补发新需求继续执行，暂不调 @aligner，等新需求跑完再统一审稿。'));
       assert.ok(reminder.includes('- 若无需补发改动：请调用 `subagent(agent="aligner", background=false, description="Audit @designer g_pre-1")` 独立审稿。'));
       assert.doesNotMatch(reminder, /检测到后台运行期间有用户新消息/);
@@ -270,7 +270,7 @@ test("aligner reuses its session within a turn and starts fresh across turns", (
   assert.equal(state.windowCount, 1);
   assert.equal(state.alignerSessionID, null);
   assert.equal(applyMandateGateToV2Event(event, dir), true);
-  assert.match(messages.at(-1).content[0].text, /1\/2/);
+  assert.match(messages.at(-1).content[0].text, /1\/5/);
   const first = { tool: "subagent", sessionID: event.sessionID, input: { agent: "aligner" } };
   assert.equal(enrichAlignerSubagentCall(first, dir), true);
   assert.equal(first.input.sessionID, undefined);
@@ -286,7 +286,7 @@ test("aligner reuses its session within a turn and starts fresh across turns", (
   assert.equal(state.windowCount, 2);
   assert.equal(state.alignerSessionID, "ses_aligner_r1");
   assert.equal(applyMandateGateToV2Event(event, dir), true);
-  assert.match(messages.at(-1).content[0].text, /2\/2/);
+  assert.match(messages.at(-1).content[0].text, /2\/5/);
   assert.match(messages.at(-1).content[0].text, /sessionID="ses_aligner_r1"/);
   const second = { tool: "subagent", sessionID: event.sessionID, input: { agent: "aligner", prompt: "Run npm test" } };
   assert.equal(enrichAlignerSubagentCall(second, dir), true);
@@ -357,15 +357,15 @@ test("POLISH and REJECT bounce back identically in every round through the confi
     const reminders = [];
     for (const verdict of ["ALIGN_REJECT", "ALIGN_POLISH"]) {
       const messages = [user()];
-      for (let round = 1; round <= 3; round++) {
+      for (let round = 1; round <= 6; round++) {
         const audit = alignerMessages(`[${verdict}] Fix remaining issues`, format);
         messages.push(...audit.slice(1));
         const state = analyzeAuditWindow(messages);
         assert.equal(state.windowCount, round);
-        assert.equal(state.alignerRejected, round <= 2, `${verdict} ${format} round ${round}`);
-        assert.equal(analyzeAuditWindow(messages, 3).alignerRejected, true);
+        assert.equal(state.alignerRejected, round <= 5, `${verdict} ${format} round ${round}`);
+        assert.equal(analyzeAuditWindow(messages, 6).alignerRejected, true);
         const injected = applyMandateGateToV2Event({ messages }, dir);
-        assert.equal(injected, round <= 2);
+        assert.equal(injected, round <= 5);
         if (injected) {
           const text = messages.at(-1).content[0].text;
           assert.match(text, /审稿未通过/);
@@ -375,8 +375,8 @@ test("POLISH and REJECT bounce back identically in every round through the confi
         stripMandateGate(messages);
       }
     }
-    assert.equal(reminders[0], reminders[2]);
-    assert.equal(reminders[1], reminders[3]);
+    assert.equal(reminders[0], reminders[5]);
+    assert.equal(reminders[1], reminders[6]);
   }
 });
 

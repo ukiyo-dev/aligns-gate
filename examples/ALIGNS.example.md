@@ -1,4 +1,4 @@
-<!-- aligns-gate: max_lines=500, max_windows=2, auto_split=true, router_guard=true, use_aligner=true -->
+<!-- aligns-gate: max_lines=500, max_windows=5, auto_split=true, router_guard=true, use_aligner=true -->
 # ALIGNS.md
 
 当前处于子任务回归后的审稿窗口。不要直接采信子任务的文字总结，先核验实际产物：

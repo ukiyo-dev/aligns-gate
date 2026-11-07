@@ -15,7 +15,7 @@ const INTENT_NOTICE_MARKER = "<!-- ALIGNS_INTENT_NOTICE -->";
 const MANDATE_FILENAME = "ALIGNS.md";
 const MAX_MANDATE_LINES = 60;
 const MAX_MANDATE_CHARS = 3200;
-const MAX_WINDOWS_PER_TURN = 2;
+const MAX_WINDOWS_PER_TURN = 5;
 const MONOLITH_LINE_LIMIT = 500;
 const DEHYDRATED_TEXT = "[Audit result cleared after review]";
 

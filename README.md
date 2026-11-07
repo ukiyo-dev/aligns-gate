@@ -18,7 +18,7 @@ DeepSeek 在那篇实验里提到了一个很有意思的现象：哪怕给主�
 ![审慎写入确认](https://iili.io/nthLjgR.png)
 
 **2. Worker 刚跑完交卷？派 `@aligner` 独立审稿，审完连图带字一起清掉**  
-`ALIGNS.md` 平时不进上下文。只有 `@designer` 或 `@fixer` 刚干完活回来的那一刻，界面出现 `aligns-gate: 人类意图对齐`，插件会提醒主控调 `@aligner` 独立审稿，并自动把用户原话、Worker 报告和 `ALIGNS.md` 对应角色的红线拼进 `@aligner` 的提示词里，让它去截真机图或跑测试。不达标就打回原 `sessionID` 重做，单轮对话最多审 2 次。  
+`ALIGNS.md` 平时不进上下文。只有 `@designer` 或 `@fixer` 刚干完活回来的那一刻，界面出现 `aligns-gate: 人类意图对齐`，插件会提醒主控调 `@aligner` 独立审稿，并自动把用户原话、Worker 报告和 `ALIGNS.md` 对应角色的红线拼进 `@aligner` 的提示词里，让它去截真机图或跑测试。不达标就打回原 `sessionID` 重做，单轮对话最多打回 5 次。  
 等这波审稿一结束，临时注入的提示词自动剥离，审稿期间截的页面大图和超过 180 字符的工具长输出也会被原地替换成 `[Audit result cleared after review]`，给主控腾出干净的上下文。
 
 ![人类意图对齐](https://iili.io/nthLy1j.png)
@@ -57,7 +57,7 @@ DeepSeek 在那篇实验里提到了一个很有意思的现象：哪怕给主�
 插件向上查找项目根目录下的 `ALIGNS.md`，没放这个文件的项目不会触发审稿和拆文件。可以直接参考 [`examples/ALIGNS.example.md`](./examples/ALIGNS.example.md)：
 
 ```markdown
-<!-- aligns-gate: max_lines=500, max_windows=2, auto_split=true, router_guard=true, use_aligner=true -->
+<!-- aligns-gate: max_lines=500, max_windows=5, auto_split=true, router_guard=true, use_aligner=true -->
 # ALIGNS.md
 
 当前处于子任务回归后的审稿窗口。不要直接采信子任务的文字总结，先核验实际产物：
@@ -77,7 +77,7 @@ DeepSeek 在那篇实验里提到了一个很有意思的现象：哪怕给主�
 写在 `ALIGNS.md` 第一行的注释里即可，发给模型前会自动剥离，不占 Token；也可以通过环境变量覆盖：
 
 - `max_lines` / `ALIGNS_GATE_MAX_LINES`：超过多少行触发拆文件，默认 `500`
-- `max_windows` / `ALIGNS_GATE_MAX_WINDOWS`：单轮最多激活几次审稿窗口，默认 `2`
+- `max_windows` / `ALIGNS_GATE_MAX_WINDOWS`：单轮最多激活几次审稿窗口，默认 `5`
 - `auto_split` / `ALIGNS_GATE_AUTO_SPLIT`：审稿完是否自动扫大文件并触发拆分，默认 `true`
 - `router_guard` / `ALIGNS_GATE_ROUTER_GUARD`：是否拦截主控直接改业务源码，默认 `true`
 - `use_aligner` / `ALIGNS_GATE_USE_ALIGNER`：是否派发独立 `@aligner` 审稿，默认 `true`
