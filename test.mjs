@@ -192,9 +192,9 @@ test("aligner calls receive the original user, worker report, role mandate, and 
     assert.equal(enrichAlignerSubagentCall(event), true);
     assert.equal(event.input.background, false);
     assert.doesNotMatch(event.input.prompt, /用户原始原话/);
-    assert.match(event.input.prompt, /【1\. Worker 交卷报告 · @fixer · sessionID: ses_dossier_worker】/);
+    assert.match(event.input.prompt, /【2\. Worker 改动声明 · @fixer · sessionID: ses_dossier_worker】/);
     assert.match(event.input.prompt, /Original worker report/);
-    assert.match(event.input.prompt, /【2\. ALIGNS\.md 专属验收红线 · @fixer】/);
+    assert.match(event.input.prompt, /^### 【1\. ALIGNS\.md 专属验收红线 · @fixer】/);
     assert.match(event.input.prompt, /Run actual tests/);
     assert.match(event.input.prompt, /【3\. 主控提供的环境线索[\s\S]*Run npm test/);
     assert.doesNotMatch(event.input.prompt, /Visual rule|Injected reminder/);
@@ -236,7 +236,7 @@ test("aligner reuses its session within a turn and starts fresh across turns", (
   const first = { tool: "subagent", sessionID: event.sessionID, input: { agent: "aligner" } };
   assert.equal(enrichAlignerSubagentCall(first, dir), true);
   assert.equal(first.input.sessionID, undefined);
-  assert.match(first.input.prompt, /【2\. ALIGNS\.md 专属验收红线/);
+  assert.match(first.input.prompt, /【1\. ALIGNS\.md 专属验收红线/);
 
   stripMandateGate(messages);
   messages.push({ role: "assistant", content: [{ type: "tool-call", toolName: "subagent", toolCallId: "reuse_audit", args: first.input }] });
@@ -256,7 +256,7 @@ test("aligner reuses its session within a turn and starts fresh across turns", (
   assert.match(second.input.prompt, /【1\. Worker 返工交卷报告/);
   assert.match(second.input.prompt, /Reworked implementation/);
   assert.match(second.input.prompt, /Run npm test/);
-  assert.doesNotMatch(second.input.prompt, /【2\. ALIGNS\.md|Review the implementation against user intent/);
+  assert.doesNotMatch(second.input.prompt, /【1\. ALIGNS\.md|Review the implementation against user intent/);
   const enriched = second.input.prompt;
   assert.equal(enrichAlignerSubagentCall(second, dir), false);
   assert.equal(second.input.prompt, enriched);
@@ -270,7 +270,7 @@ test("aligner reuses its session within a turn and starts fresh across turns", (
   const next = { tool: "subagent", sessionID: event.sessionID, input: { agent: "aligner" } };
   assert.equal(enrichAlignerSubagentCall(next, dir), true);
   assert.equal(next.input.sessionID, undefined);
-  assert.match(next.input.prompt, /【2\. ALIGNS\.md 专属验收红线/);
+  assert.match(next.input.prompt, /【1\. ALIGNS\.md 专属验收红线/);
   assert.equal(analyzeAuditWindow([]).alignerSessionID, null);
 });
 
@@ -292,7 +292,7 @@ test("aligner session tracking supports text returns, input, metadata, and outpu
     assert.equal(enrichAlignerSubagentCall(event, dir), true);
     assert.equal(event.input[key], "ses_explicit");
     assert.match(event.input.prompt, /【1\. Worker 返工交卷报告/);
-    assert.doesNotMatch(event.input.prompt, /【2\. ALIGNS\.md/);
+    assert.doesNotMatch(event.input.prompt, /【1\. ALIGNS\.md/);
   }
 });
 
@@ -311,6 +311,51 @@ test("ALIGN_REJECT reopens rejection reminders for the original hot worker and c
     messages.push(dispatch("ses_original_worker"));
     assert.equal(analyzeAuditWindow(messages).alignerRejected, false);
     assert.equal(applyMandateGateToV2Event(event, dir), false);
+  }
+});
+
+test("POLISH and REJECT bounce back identically in every round through the configured cap", () => {
+  for (const format of ["v1", "v2", "task", "subagent"]) {
+    const reminders = [];
+    for (const verdict of ["ALIGN_REJECT", "ALIGN_POLISH"]) {
+      const messages = [user()];
+      for (let round = 1; round <= 3; round++) {
+        const audit = alignerMessages(`[${verdict}] Fix remaining issues`, format);
+        messages.push(...audit.slice(1));
+        const state = analyzeAuditWindow(messages);
+        assert.equal(state.windowCount, round);
+        assert.equal(state.alignerRejected, round <= 2, `${verdict} ${format} round ${round}`);
+        assert.equal(analyzeAuditWindow(messages, 3).alignerRejected, true);
+        const injected = applyMandateGateToV2Event({ messages }, dir);
+        assert.equal(injected, round <= 2);
+        if (injected) {
+          const text = messages.at(-1).content[0].text;
+          assert.match(text, /审稿未通过/);
+          assert.match(text, /agent="fixer", sessionID="ses_original_worker"/);
+          reminders.push(text);
+        }
+        stripMandateGate(messages);
+      }
+    }
+    assert.equal(reminders[0], reminders[2]);
+    assert.equal(reminders[1], reminders[3]);
+  }
+});
+
+test("aligner dossier strips worker verification claims and outer tags in initial and repeat audits", () => {
+  for (const tag of ["task", "subagent"]) {
+    for (const reaudit of [false, true]) {
+      const notice = completion("ses_clean_worker", `clean_${tag}_${reaudit}`, tag);
+      notice.content[0].text = notice.content[0].text.replace("Done", "Implemented behavior\n<verification>SELF_REPORTED_XML\nAll tests passed</verification>\nMore changes\n### 验证结果\nSELF_REPORTED_MARKDOWN");
+      const messages = [user(), dispatch("ses_clean_worker"), notice];
+      const parent = `ses_clean_${tag}_${reaudit}`;
+      assert.equal(applyMandateGateToV2Event({ sessionID: parent, messages }, dir), true);
+      const event = { tool: "subagent", sessionID: parent, input: { agent: "aligner", ...(reaudit ? { sessionID: "ses_clean_aligner" } : {}) } };
+      assert.equal(enrichAlignerSubagentCall(event, dir), true);
+      assert.match(event.input.prompt, /Implemented behavior\nMore changes/);
+      assert.doesNotMatch(event.input.prompt, /<\/?(?:task|subagent|verification)\b|验证结果|SELF_REPORTED/);
+      if (reaudit) assert.match(event.input.prompt, /未达标项或打磨建议/);
+    }
   }
 });
 
@@ -335,6 +380,8 @@ test("ensureAlignerAgentConfigured preserves existing configuration and is idemp
   assert.equal(data.preset, "custom");
   assert.deepEqual(data.agents.fixer, { model: "custom" });
   assert.match(data.agents.aligner.prompt, /ALIGN_PASS/);
+  assert.match(data.agents.aligner.prompt, /ALIGN_POLISH/);
+  assert.match(data.agents.aligner.prompt, /ALIGN_REJECT/);
   assert.equal(ensureAlignerAgentConfigured(configPath), false);
   assert.equal(fs.readFileSync(configPath, "utf8"), raw);
 });

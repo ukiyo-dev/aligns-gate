@@ -651,7 +651,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
             if (agent === "aligner") {
               turnAlignerSessionID = sesId;
               if (activeReturnWatermark) windowClosedByAction = true;
-              if (/\[ALIGN_REJECT\]/i.test(part.text)) alignerRejected = true;
+              if (/\[ALIGN_(?:REJECT|POLISH)\]/i.test(part.text)) alignerRejected = true;
               if (/\[ALIGN_PASS\]/i.test(part.text)) alignerRejected = false;
             }
             if (!NON_WRITER_AGENTS.has(agent) && (WRITER_AGENTS.has(agent) || agent === "unknown")) {
@@ -708,7 +708,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
           if (alignerSesMatch) turnAlignerSessionID = alignerSesMatch[1];
           else if (typeof effectiveInput?.sessionID === "string") turnAlignerSessionID = effectiveInput.sessionID;
           else if (typeof info.metaSessionID === "string") turnAlignerSessionID = info.metaSessionID;
-          if (/\[ALIGN_REJECT\]/i.test(alignerText)) alignerRejected = true;
+          if (/\[ALIGN_(?:REJECT|POLISH)\]/i.test(alignerText)) alignerRejected = true;
           if (/\[ALIGN_PASS\]/i.test(alignerText)) alignerRejected = false;
         }
         const isForegroundCompleted =
@@ -980,6 +980,8 @@ function cleanWorkerReportText(raw) {
   return raw
     .replace(/^\s*<(?:subagent|task)\b[^>]*>\r?\n?/i, "")
     .replace(/\r?\n?<\/(?:subagent|task)>\s*$/i, "")
+    .replace(/\r?\n?<verification>[\s\S]*?<\/verification>/gi, "")
+    .replace(/\r?\n#{1,4}\s*验证结果[\s\S]*$/i, "")
     .trim();
 }
 
@@ -988,7 +990,7 @@ export function enrichAlignerSubagentCall(event, workDir) {
   if (toolName !== "subagent" && toolName !== "task") return false;
   if (getSubagentTarget(event.input) !== "aligner") return false;
   event.input.background = false;
-  if (typeof event.input.prompt === "string" && (event.input.prompt.includes("【1. Worker 交卷报告") || event.input.prompt.includes("【1. Worker 返工交卷报告"))) return false;
+  if (typeof event.input.prompt === "string" && (event.input.prompt.includes("【1. ALIGNS.md 专属验收红线") || event.input.prompt.includes("【1. Worker 返工交卷报告"))) return false;
   const cached = event.sessionID ? lastSessionState.get(event.sessionID) : null;
   const reuseAlignerId = event.input.sessionID || event.input.task_id || cached?.alignerSessionID || null;
   const isReaudit = Boolean(reuseAlignerId);
@@ -1014,13 +1016,13 @@ export function enrichAlignerSubagentCall(event, workDir) {
     event.input.prompt = `### 【1. Worker 返工交卷报告 · @${workerAgent}${sessionLabel}】
 ${cleanedReport || "未捕获到 Worker 报告原文"}
 
-请对照你上一轮给出的 \`[ALIGN_REJECT]\` 缺陷清单与 ALIGNS.md 红线逐项复核，确认所有问题已真实修复且未引入新问题。${hostNoteSection}`;
+请对照你上一轮指出的未达标项或打磨建议与 ALIGNS.md 红线逐项复核，确认所有问题已真实落实且未引入新问题。${hostNoteSection}`;
   } else {
-    event.input.prompt = `### 【1. Worker 交卷报告 · @${workerAgent}${sessionLabel}】
-${cleanedReport || "未捕获到 Worker 报告原文"}
+    event.input.prompt = `### 【1. ALIGNS.md 专属验收红线 · @${workerAgent}】
+${mandateContent || "无额外 ALIGNS.md 规则"}
 
-### 【2. ALIGNS.md 专属验收红线 · @${workerAgent}】
-${mandateContent || "无额外 ALIGNS.md 规则"}${hostNoteSection}`;
+### 【2. Worker 改动声明 · @${workerAgent}${sessionLabel}】
+${cleanedReport || "未捕获到 Worker 报告原文"}${hostNoteSection}`;
   }
   return true;
 }
@@ -1037,7 +1039,7 @@ export function ensureAlignerAgentConfigured(configPath = path.join(os.homedir()
         permission: { "*": "allow" },
         skills: ["chrome-devtools-cli"],
         mcps: [],
-        prompt: "你是独立质检员 @aligner，不负责实现或修改代码。以用户原话和 ALIGNS.md 为验收准绳，独立运行真实测试；前端必须浏览器截图桌面端和移动端并验证核心交互。回复开头必须给出 [ALIGN_PASS] 或 [ALIGN_REJECT]，附核验凭据或具体缺陷及复现位置。"
+        prompt: "你是独立质检员 @aligner，不负责实现或修改代码。以用户原话和 ALIGNS.md 为验收准绳，独立运行真实测试；前端必须浏览器截图桌面端和移动端并验证核心交互。回复开头必须给出 [ALIGN_PASS]（全部达标）、[ALIGN_POLISH]（仍需打磨）或 [ALIGN_REJECT]（未达标），附核验凭据或具体缺陷及复现位置。"
       }
     };
     fs.writeFileSync(configPath, `${JSON.stringify(data, null, 2)}\n`);
