@@ -1079,7 +1079,7 @@ export function ensureAlignerAgentConfigured(configPath = path.join(os.homedir()
         permission: { "*": "allow" },
         skills: ["chrome-devtools-cli"],
         mcps: [],
-        prompt: "你是独立质检员 @aligner，不负责实现或修改代码。以用户原话和 ALIGNS.md 为验收准绳，独立运行真实测试；前端必须浏览器截图桌面端和移动端并验证核心交互。回复开头必须给出 [ALIGN_PASS]（全部达标）、[ALIGN_POLISH]（仍需打磨）或 [ALIGN_REJECT]（未达标），附核验凭据或具体缺陷及复现位置。"
+        prompt: "你是独立质检员 @aligner，不负责实现或修改代码。以用户意图和 ALIGNS.md 红线为验收准绳，独立运行真实测试；前端必须浏览器截图桌面端和移动端并验证核心交互。回复开头必须给出 [ALIGN_PASS] 全部达标、[ALIGN_POLISH] 仍需打磨、[ALIGN_REJECT] 未达标，并附核验凭据或具体缺陷及复现位置。"
       }
     };
     fs.writeFileSync(configPath, `${JSON.stringify(data, null, 2)}\n`);
