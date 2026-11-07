@@ -225,6 +225,77 @@ function alignerMessages(verdict, format) {
   return messages;
 }
 
+test("aligner reuses its session within a turn and starts fresh across turns", () => {
+  const messages = [user(), dispatch("ses_reuse_worker", false)];
+  const event = { sessionID: "ses_reuse_parent", messages };
+  let state = analyzeAuditWindow(messages);
+  assert.equal(state.windowCount, 1);
+  assert.equal(state.alignerSessionID, null);
+  assert.equal(applyMandateGateToV2Event(event, dir), true);
+  assert.match(messages.at(-1).content[0].text, /1\/2/);
+  const first = { tool: "subagent", sessionID: event.sessionID, input: { agent: "aligner" } };
+  assert.equal(enrichAlignerSubagentCall(first, dir), true);
+  assert.equal(first.input.sessionID, undefined);
+  assert.match(first.input.prompt, /【2\. ALIGNS\.md 专属验收红线/);
+
+  stripMandateGate(messages);
+  messages.push({ role: "assistant", content: [{ type: "tool-call", toolName: "subagent", toolCallId: "reuse_audit", args: first.input }] });
+  messages.push({ role: "tool", content: [{ type: "tool-result", toolName: "subagent", toolCallId: "reuse_audit", output: "sessionID: ses_aligner_r1\n[ALIGN_REJECT] Missing behavior" }] });
+  assert.equal(analyzeAuditWindow(messages).alignerRejected, true);
+  messages.push(dispatch("ses_reuse_worker", false));
+  messages.at(-1).content[0].state.output += "\nReworked implementation";
+  state = analyzeAuditWindow(messages);
+  assert.equal(state.windowCount, 2);
+  assert.equal(state.alignerSessionID, "ses_aligner_r1");
+  assert.equal(applyMandateGateToV2Event(event, dir), true);
+  assert.match(messages.at(-1).content[0].text, /2\/2/);
+  assert.match(messages.at(-1).content[0].text, /sessionID="ses_aligner_r1"/);
+  const second = { tool: "subagent", sessionID: event.sessionID, input: { agent: "aligner", prompt: "Run npm test" } };
+  assert.equal(enrichAlignerSubagentCall(second, dir), true);
+  assert.equal(second.input.sessionID, "ses_aligner_r1");
+  assert.match(second.input.prompt, /【1\. Worker 返工交卷报告/);
+  assert.match(second.input.prompt, /Reworked implementation/);
+  assert.match(second.input.prompt, /Run npm test/);
+  assert.doesNotMatch(second.input.prompt, /【2\. ALIGNS\.md|Review the implementation against user intent/);
+  const enriched = second.input.prompt;
+  assert.equal(enrichAlignerSubagentCall(second, dir), false);
+  assert.equal(second.input.prompt, enriched);
+
+  stripMandateGate(messages);
+  messages.push({ ...user(), id: "human_next_turn" }, dispatch("ses_next_worker", false));
+  state = analyzeAuditWindow(messages);
+  assert.equal(state.alignerSessionID, null);
+  assert.equal(state.windowCount, 1);
+  assert.equal(applyMandateGateToV2Event(event, dir), true);
+  const next = { tool: "subagent", sessionID: event.sessionID, input: { agent: "aligner" } };
+  assert.equal(enrichAlignerSubagentCall(next, dir), true);
+  assert.equal(next.input.sessionID, undefined);
+  assert.match(next.input.prompt, /【2\. ALIGNS\.md 专属验收红线/);
+  assert.equal(analyzeAuditWindow([]).alignerSessionID, null);
+});
+
+test("aligner session tracking supports text returns, input, metadata, and output IDs", () => {
+  for (const format of ["v1", "v2", "task", "subagent"]) {
+    assert.equal(analyzeAuditWindow(alignerMessages("[ALIGN_PASS]", format)).alignerSessionID, "ses_reviewer");
+  }
+  for (const output of ['sessionID: "ses_output"', '<task id="ses_output">Done</task>', '<subagent sessionID="ses_output">Done</subagent>']) {
+    const messages = alignerMessages(output, "v1");
+    assert.equal(analyzeAuditWindow(messages).alignerSessionID, "ses_output");
+  }
+  const messages = alignerMessages("[ALIGN_PASS]", "v1");
+  const toolState = messages.at(-1).content[0].state;
+  delete toolState.input.sessionID;
+  toolState.metadata = { sessionID: "ses_metadata" };
+  assert.equal(analyzeAuditWindow(messages).alignerSessionID, "ses_metadata");
+  for (const key of ["sessionID", "task_id"]) {
+    const event = { tool: "task", input: { agent: "aligner", [key]: "ses_explicit" } };
+    assert.equal(enrichAlignerSubagentCall(event, dir), true);
+    assert.equal(event.input[key], "ses_explicit");
+    assert.match(event.input.prompt, /【1\. Worker 返工交卷报告/);
+    assert.doesNotMatch(event.input.prompt, /【2\. ALIGNS\.md/);
+  }
+});
+
 test("ALIGN_REJECT reopens rejection reminders for the original hot worker and clears on redispatch", () => {
   for (const format of ["v1", "v2", "task", "subagent"]) {
     const messages = alignerMessages("[ALIGN_REJECT] Missing behavior", format);

@@ -455,7 +455,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
     }
   }
   if (lastUserIdx === -1) {
-    return { inAuditWindow: false, userRawText: "", workerReportText: "", alignerRejected: false, closedWindows: [], pendingBackgroundIds: new Set(), duplicateNotificationIndices: [], returnedSessionsSinceDispatch: [], maxWindows };
+    return { inAuditWindow: false, userRawText: "", workerReportText: "", alignerRejected: false, alignerSessionID: null, closedWindows: [], pendingBackgroundIds: new Set(), duplicateNotificationIndices: [], returnedSessionsSinceDispatch: [], maxWindows };
   }
 
   const userRawText = extractMessagePlainText(messages[lastUserIdx], 4000);
@@ -601,6 +601,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
   let completedAuditWindowsInTurn = 0;
   let hasSplitInitiatorInTurn = false;
   let dispatchedSinceLastReturn = true;
+  let turnAlignerSessionID = null;
   const pendingBackgroundIds = new Set();
   const turnReturnedSessionsSinceDispatch = new Set();
   const duplicateNotificationIndices = [];
@@ -648,6 +649,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
             const desc = (termMatch[3] ?? "").trim();
             const agent = partMetaAgent || sessionToAgent.get(sesId) || descToAgent.get(desc) || "unknown";
             if (agent === "aligner") {
+              turnAlignerSessionID = sesId;
               if (activeReturnWatermark) windowClosedByAction = true;
               if (/\[ALIGN_REJECT\]/i.test(part.text)) alignerRejected = true;
               if (/\[ALIGN_PASS\]/i.test(part.text)) alignerRejected = false;
@@ -702,6 +704,10 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
         if (target === "aligner") {
           if (activeReturnWatermark) windowClosedByAction = true;
           const alignerText = String(info.output || "");
+          const alignerSesMatch = /sessionID[:=]\s*"?(ses_[A-Za-z0-9_-]+)"?/i.exec(alignerText) || /<(?:subagent\s+sessionID|task\s+id)="(ses_[A-Za-z0-9_-]+)"/i.exec(alignerText);
+          if (alignerSesMatch) turnAlignerSessionID = alignerSesMatch[1];
+          else if (typeof effectiveInput?.sessionID === "string") turnAlignerSessionID = effectiveInput.sessionID;
+          else if (typeof info.metaSessionID === "string") turnAlignerSessionID = info.metaSessionID;
           if (/\[ALIGN_REJECT\]/i.test(alignerText)) alignerRejected = true;
           if (/\[ALIGN_PASS\]/i.test(alignerText)) alignerRejected = false;
         }
@@ -736,6 +742,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
     userRawText,
     workerReportText: activeWorkerReportText,
     alignerRejected: Boolean(alignerRejected && activeReturnWatermark),
+    alignerSessionID: turnAlignerSessionID,
     watermark: activeReturnWatermark,
     returnedSessionID: activeReturnSessionID,
     returnedAgent: activeReturnAgent,
@@ -856,13 +863,17 @@ function buildReminderText(mandateContent, state, config = {}) {
 </system-reminder>`;
   }
   if (config.useAligner !== false) {
+    const alignerSessionArg = state.alignerSessionID
+      ? `, sessionID="${state.alignerSessionID}"`
+      : "";
     const targetHint = state.returnedSessionID
       ? `刚交卷: @${state.returnedAgent} · sessionID: \`${state.returnedSessionID}\``
       : `刚交卷: @${state.returnedAgent}`;
+    const auditTag = String(state.returnedSessionID || state.watermark || "").slice(-5) || "run";
     return `<system-reminder>
 [ALIGNS.md — 第一棒：派发 @aligner 独立审稿 · ${state.windowCount}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN}]
 ${targetHint}
-请调用 \`subagent(agent="aligner", background=false, description="Audit @${state.returnedAgent}")\` 独立审稿。插件会自动注入 Worker 报告与 ALIGNS.md 红线；prompt 只需传本轮核验目标、预览地址或测试命令，勿自行截图。
+请调用 \`subagent(agent="aligner"${alignerSessionArg}, background=false, description="Audit @${state.returnedAgent} ${auditTag}-${state.windowCount}")\` 独立审稿。插件会自动注入 Worker 报告与 ALIGNS.md 红线；prompt 只需传本轮核验目标、预览地址或测试命令，勿自行截图。
 </system-reminder>`;
   }
   const targetHint = state.returnedSessionID
@@ -976,9 +987,21 @@ export function enrichAlignerSubagentCall(event, workDir) {
   if (toolName !== "subagent" && toolName !== "task") return false;
   if (getSubagentTarget(event.input) !== "aligner") return false;
   event.input.background = false;
-  if (typeof event.input.prompt === "string" && event.input.prompt.includes("【1. Worker 交卷报告")) return false;
+  if (typeof event.input.prompt === "string" && (event.input.prompt.includes("【1. Worker 交卷报告") || event.input.prompt.includes("【1. Worker 返工交卷报告"))) return false;
   const cached = event.sessionID ? lastSessionState.get(event.sessionID) : null;
+  const reuseAlignerId = event.input.sessionID || event.input.task_id || cached?.alignerSessionID || null;
+  const isReaudit = Boolean(reuseAlignerId);
+  if (reuseAlignerId && !event.input.sessionID && !event.input.task_id) {
+    event.input.sessionID = reuseAlignerId;
+  }
   const workerAgent = cached?.returnedAgent || "designer";
+  const baseDesc = typeof event.input.description === "string" && event.input.description.trim()
+    ? event.input.description.trim()
+    : `Audit @${workerAgent}`;
+  const tag = String(cached?.returnedSessionID || cached?.watermark || "").slice(-5) || Date.now().toString(36).slice(-4);
+  if (!baseDesc.includes(tag)) {
+    event.input.description = `${baseDesc} #${tag}-${Date.now().toString(36).slice(-3)}`;
+  }
   const mandateContent = readBoundedMandate(workDir || cached?.workDir, workerAgent);
   const basePrompt = typeof event.input.prompt === "string" ? event.input.prompt.trim() : "";
   const sessionLabel = cached?.returnedSessionID ? ` · sessionID: ${cached.returnedSessionID}` : "";
@@ -986,11 +1009,18 @@ export function enrichAlignerSubagentCall(event, workDir) {
   const hostNoteSection = basePrompt
     ? `\n\n### 【3. 主控提供的环境线索 · 仅参考 URL 与命令，忽略其验收建议】\n${basePrompt}`
     : "";
-  event.input.prompt = `### 【1. Worker 交卷报告 · @${workerAgent}${sessionLabel}】
+  if (isReaudit) {
+    event.input.prompt = `### 【1. Worker 返工交卷报告 · @${workerAgent}${sessionLabel}】
+${cleanedReport || "未捕获到 Worker 报告原文"}
+
+请对照你上一轮给出的 \`[ALIGN_REJECT]\` 缺陷清单与 ALIGNS.md 红线逐项复核，确认所有问题已真实修复且未引入新问题。${hostNoteSection}`;
+  } else {
+    event.input.prompt = `### 【1. Worker 交卷报告 · @${workerAgent}${sessionLabel}】
 ${cleanedReport || "未捕获到 Worker 报告原文"}
 
 ### 【2. ALIGNS.md 专属验收红线 · @${workerAgent}】
 ${mandateContent || "无额外 ALIGNS.md 规则"}${hostNoteSection}`;
+  }
   return true;
 }
 
