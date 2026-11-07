@@ -1,6 +1,6 @@
 {
   "name": "aligns-gate",
-  "version": "1.2.0",
+  "version": "2.0.0",
   "description": "DeepSeek Super-agent inspired OpenCode harness plugin: Router/Worker write guard, event-driven ALIGNS.md audit windows, post-review context dehydration, and idle watchdog monolith splitting.",
   "type": "module",
   "main": "./index.mjs",

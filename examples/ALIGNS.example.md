@@ -1,4 +1,4 @@
-<!-- aligns-gate: max_lines=500, max_windows=2, auto_split=true, router_guard=true -->
+<!-- aligns-gate: max_lines=500, max_windows=2, auto_split=true, router_guard=true, use_aligner=true -->
 # ALIGNS.md
 
 当前处于子任务回归后的审稿窗口。不要直接采信子任务的文字总结，先核验实际产物：
@@ -7,8 +7,8 @@
 2. 主控负责规划、派发与验收，不直接下场写业务代码。
 
 ## @designer
-1. 调用浏览器工具打开页面实机截图（桌面端 + 移动端视口），动手点一遍核心交互。
-2. 排查常见的敷衍问题：等宽卡片生硬堆砌、缺乏视觉重心、文字截断错位、缺少空状态/加载态、机翻感文案。
+1. 调用浏览器工具打开页面实机截图桌面端与移动端视口，动手点一遍核心交互。
+2. 排查常见的敷衍问题：等宽卡片生硬堆砌、缺乏视觉重心、文字截断错位、缺少空状态或加载态、机翻感文案。
 3. 视觉和交互问题一律带原 `sessionID` 打回 `@designer`。
 
 ## @fixer

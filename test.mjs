@@ -8,6 +8,8 @@ import plugin, {
   applyMandateGateToV1Messages,
   applyMandateGateToV2Event,
   enforceOrchestratorRouterGuard,
+  enrichAlignerSubagentCall,
+  ensureAlignerAgentConfigured,
   installSyntheticTaskDeduper,
   maybeEmitIntentAlignNotice,
   neutralizeDuplicateTaskNotifications,
@@ -15,7 +17,7 @@ import plugin, {
   stripMandateGate
 } from "./index.mjs";
 
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aligns-gate-test-"));
+const dir = fs.mkdtempSync(path.join("/tmp/opencode", "aligns-gate-test-"));
 fs.writeFileSync(path.join(dir, "ALIGNS.md"), "Review the implementation against user intent.");
 after(() => fs.rmSync(dir, { recursive: true, force: true }));
 const user = () => ({ id: "human", role: "user", content: [{ type: "text", text: "Implement this" }] });
@@ -150,8 +152,119 @@ test("parseMandateConfig parses HTML comments and YAML frontmatter cleanly", () 
   const { config, cleanRaw } = parseMandateConfig(
     "<!-- aligns-gate: max_lines=380, max_windows=3, auto_split=false, router_guard=false -->\n# ALIGNS\nKeep it real."
   );
-  assert.deepEqual(config, { maxLines: 380, maxWindows: 3, autoSplit: false, routerGuard: false });
+  assert.deepEqual(config, { maxLines: 380, maxWindows: 3, autoSplit: false, routerGuard: false, useAligner: true });
   assert.equal(cleanRaw, "# ALIGNS\nKeep it real.");
+});
+
+test("aligner configuration supports aliases, environment default, and inline fallback", () => {
+  assert.equal(parseMandateConfig("<!-- aligns-gate: use_aligner=false -->").config.useAligner, false);
+  assert.equal(parseMandateConfig("---\nuseAligner: true\n---\nRules").config.useAligner, true);
+  const previous = process.env.ALIGNS_GATE_USE_ALIGNER;
+  try {
+    process.env.ALIGNS_GATE_USE_ALIGNER = "false";
+    assert.equal(parseMandateConfig("").config.useAligner, false);
+  } finally {
+    if (previous === undefined) delete process.env.ALIGNS_GATE_USE_ALIGNER;
+    else process.env.ALIGNS_GATE_USE_ALIGNER = previous;
+  }
+  const inlineDir = path.join(dir, "inline");
+  fs.mkdirSync(inlineDir);
+  fs.writeFileSync(path.join(inlineDir, "ALIGNS.md"), "<!-- aligns-gate: use_aligner=false -->\nInline red line");
+  for (const v1 of [true, false]) {
+    const messages = [user(), dispatch("ses_inline", false)];
+    assert.equal(v1 ? applyMandateGateToV1Messages(messages, inlineDir)
+      : applyMandateGateToV2Event({ messages }, inlineDir), true);
+    assert.match((messages.at(-1).parts ?? messages.at(-1).content)[0].text, /审稿窗口期已激活[\s\S]*Inline red line/);
+  }
+});
+
+test("aligner calls receive the original user, worker report, role mandate, and synchronous execution", () => {
+  const scopedDir = path.join(dir, "scoped");
+  fs.mkdirSync(scopedDir);
+  fs.writeFileSync(path.join(scopedDir, "ALIGNS.md"), "Common rule\n## @fixer\nRun actual tests\n## @designer\nVisual rule");
+  const messages = [user(), dispatch("ses_dossier_worker", false)];
+  messages[1].content[0].state.output += "\nOriginal worker report";
+  messages[0].content.push({ type: "text", synthetic: true, text: "Injected reminder", metadata: { "oh-my-opencode-slim.orchestratorMandateGate": true } });
+  assert.equal(applyMandateGateToV2Event({ sessionID: "ses_dossier", messages }, scopedDir), true);
+  assert.match(messages.at(-1).content[0].text, /第一棒：派发 @aligner/);
+  for (const tool of ["subagent", "task"]) {
+    const event = { tool, sessionID: "ses_dossier", input: { agent: "aligner", background: true, prompt: "Run npm test" } };
+    assert.equal(enrichAlignerSubagentCall(event), true);
+    assert.equal(event.input.background, false);
+    assert.match(event.input.prompt, /【1\. 用户原始原话】\nImplement this/);
+    assert.match(event.input.prompt, /【2\. Worker 交卷报告 · @fixer · sessionID: ses_dossier_worker】/);
+    assert.match(event.input.prompt, /Original worker report/);
+    assert.match(event.input.prompt, /【3\. ALIGNS\.md 专属验收红线 · @fixer】/);
+    assert.match(event.input.prompt, /Run actual tests/);
+    assert.doesNotMatch(event.input.prompt, /Visual rule|Injected reminder/);
+    const prompt = event.input.prompt;
+    event.input.background = true;
+    assert.equal(enrichAlignerSubagentCall(event), false);
+    assert.equal(event.input.background, false);
+    assert.equal(event.input.prompt, prompt);
+  }
+  assert.equal(enrichAlignerSubagentCall({ tool: "read", input: {} }, dir), false);
+  assert.equal(enrichAlignerSubagentCall({ tool: "task", input: { agent: "fixer" } }, dir), false);
+});
+
+function alignerMessages(verdict, format) {
+  const messages = [user(), dispatch("ses_original_worker", false)];
+  const input = { agent: "aligner", background: false, sessionID: "ses_reviewer" };
+  if (format === "v1") {
+    messages.push({ role: "assistant", content: [{ type: "tool", tool: "subagent", state: { status: "completed", input, output: verdict } }] });
+  } else {
+    messages.push({ role: "assistant", content: [{ type: "tool-call", toolName: "subagent", toolCallId: "audit", args: input }] });
+    if (format === "v2") messages.push({ role: "tool", content: [{ type: "tool-result", toolName: "subagent", toolCallId: "audit", output: verdict }] });
+    else {
+      const notice = completion("ses_reviewer", "reviewer", format);
+      notice.content[0].text = notice.content[0].text.replace("Done", verdict);
+      messages.push(notice);
+    }
+  }
+  return messages;
+}
+
+test("ALIGN_REJECT reopens rejection reminders for the original hot worker and clears on redispatch", () => {
+  for (const format of ["v1", "v2", "task", "subagent"]) {
+    const messages = alignerMessages("[ALIGN_REJECT] Missing behavior", format);
+    const state = analyzeAuditWindow(messages);
+    assert.equal(state.alignerRejected, true, format);
+    assert.equal(state.inAuditWindow, false);
+    assert.equal(state.windowCount, 1);
+    const event = { sessionID: `ses_reject_${format}`, messages };
+    assert.equal(applyMandateGateToV2Event(event, dir), true);
+    assert.match(messages.at(-1).content[0].text, /\[ALIGNS\.md — @aligner 审稿未通过\]/);
+    assert.match(messages.at(-1).content[0].text, /agent="fixer", sessionID="ses_original_worker"/);
+    stripMandateGate(messages);
+    messages.push(dispatch("ses_original_worker"));
+    assert.equal(analyzeAuditWindow(messages).alignerRejected, false);
+    assert.equal(applyMandateGateToV2Event(event, dir), false);
+  }
+});
+
+test("ALIGN_PASS closes the audit without a rejection or new audit window", () => {
+  for (const format of ["v1", "v2", "task", "subagent"]) {
+    const messages = alignerMessages("[ALIGN_PASS] Tests passed", format);
+    const state = analyzeAuditWindow(messages);
+    assert.equal(state.inAuditWindow, false, format);
+    assert.equal(state.alignerRejected, false, format);
+    assert.equal(state.windowCount, 1);
+    assert.equal(applyMandateGateToV2Event({ messages }, dir), false);
+  }
+});
+
+test("ensureAlignerAgentConfigured preserves existing configuration and is idempotent", () => {
+  const configPath = path.join(dir, "agents.json");
+  assert.equal(ensureAlignerAgentConfigured(configPath), false);
+  fs.writeFileSync(configPath, JSON.stringify({ preset: "custom", agents: { fixer: { model: "custom" } } }));
+  assert.equal(ensureAlignerAgentConfigured(configPath), true);
+  const raw = fs.readFileSync(configPath, "utf8");
+  const data = JSON.parse(raw);
+  assert.equal(data.preset, "custom");
+  assert.deepEqual(data.agents.fixer, { model: "custom" });
+  assert.match(data.agents.aligner.prompt, /ALIGN_PASS/);
+  assert.equal(ensureAlignerAgentConfigured(configPath), false);
+  assert.equal(fs.readFileSync(configPath, "utf8"), raw);
 });
 
 test("enforceOrchestratorRouterGuard intercepts 1st write, allows 2nd retry, and intercepts 3rd write", () => {

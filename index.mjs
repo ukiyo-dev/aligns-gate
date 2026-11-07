@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import os from "node:os";
 
 const OMO_BOARD_KEY = "oh-my-opencode-slim.backgroundJobBoard";
 const INTERNAL_INITIATOR_KEY = "oh-my-opencode-slim.internalInitiator";
@@ -19,7 +20,7 @@ const MONOLITH_LINE_LIMIT = 500;
 const DEHYDRATED_TEXT = "[Audit result cleared after review]";
 
 const WRITER_AGENTS = new Set(["designer", "fixer"]);
-const NON_WRITER_AGENTS = new Set(["explorer", "oracle", "observer", "council"]);
+const NON_WRITER_AGENTS = new Set(["explorer", "oracle", "observer", "council", "aligner"]);
 const PRESERVED_AUDIT_TOOLS = new Set([
   "subagent",
   "task",
@@ -80,11 +81,12 @@ export function parseMandateConfig(raw) {
     maxLines: Number(process.env.ALIGNS_GATE_MAX_LINES) || MONOLITH_LINE_LIMIT,
     maxWindows: Number(process.env.ALIGNS_GATE_MAX_WINDOWS) || MAX_WINDOWS_PER_TURN,
     autoSplit: process.env.ALIGNS_GATE_AUTO_SPLIT !== "false",
-    routerGuard: process.env.ALIGNS_GATE_ROUTER_GUARD !== "false"
+    routerGuard: process.env.ALIGNS_GATE_ROUTER_GUARD !== "false",
+    useAligner: process.env.ALIGNS_GATE_USE_ALIGNER !== "false"
   };
   const config = { ...defaults };
   let cleanRaw = typeof raw === "string" ? raw : "";
-  const keys = { max_lines: "maxLines", maxLines: "maxLines", max_windows: "maxWindows", maxWindows: "maxWindows", auto_split: "autoSplit", autoSplit: "autoSplit", router_guard: "routerGuard", routerGuard: "routerGuard" };
+  const keys = { max_lines: "maxLines", maxLines: "maxLines", max_windows: "maxWindows", maxWindows: "maxWindows", auto_split: "autoSplit", autoSplit: "autoSplit", router_guard: "routerGuard", routerGuard: "routerGuard", use_aligner: "useAligner", useAligner: "useAligner" };
   const parseBlock = (_match, block) => {
     for (const entry of block.split(/[,\r\n]+/)) {
       const match = /^\s*(\w+)\s*[:=]\s*(\S+)\s*$/.exec(entry);
@@ -279,6 +281,16 @@ function isMandateTaggedPart(part) {
   return Boolean(part && typeof part === "object" && part.synthetic === true && part.metadata?.[MANDATE_GATE_KEY] === true);
 }
 
+function extractMessagePlainText(msg, maxChars = 4000) {
+  const parts = getParts(msg);
+  const text = parts
+    .filter((p) => p?.type === "text" && typeof p.text === "string" && !isMandateTaggedPart(p))
+    .map((p) => p.text.trim())
+    .filter(Boolean)
+    .join("\n");
+  return text.length > maxChars ? `${text.slice(0, maxChars)}\n...[truncated]` : text;
+}
+
 export function stripMandateGate(messages) {
   if (!Array.isArray(messages)) return;
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -443,9 +455,10 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
     }
   }
   if (lastUserIdx === -1) {
-    return { inAuditWindow: false, closedWindows: [], pendingBackgroundIds: new Set(), duplicateNotificationIndices: [], returnedSessionsSinceDispatch: [], maxWindows };
+    return { inAuditWindow: false, userRawText: "", workerReportText: "", alignerRejected: false, closedWindows: [], pendingBackgroundIds: new Set(), duplicateNotificationIndices: [], returnedSessionsSinceDispatch: [], maxWindows };
   }
 
+  const userRawText = extractMessagePlainText(messages[lastUserIdx], 4000);
   const sessionToAgent = new Map();
   const descToAgent = new Map();
   const callIdToAgent = new Map();
@@ -579,6 +592,8 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
 
   // Analyze the current turn (after lastUserIdx)
   let activeReturnWatermark = null;
+  let activeWorkerReportText = "";
+  let alignerRejected = false;
   let activeReturnSessionID = null;
   let activeReturnAgent = null;
   let activeReturnIdx = -1;
@@ -632,8 +647,15 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
             }
             const desc = (termMatch[3] ?? "").trim();
             const agent = partMetaAgent || sessionToAgent.get(sesId) || descToAgent.get(desc) || "unknown";
+            if (agent === "aligner") {
+              if (activeReturnWatermark) windowClosedByAction = true;
+              if (/\[ALIGN_REJECT\]/i.test(part.text)) alignerRejected = true;
+              if (/\[ALIGN_PASS\]/i.test(part.text)) alignerRejected = false;
+            }
             if (!NON_WRITER_AGENTS.has(agent) && (WRITER_AGENTS.has(agent) || agent === "unknown")) {
               activeReturnWatermark = `subagent:${sesId}:${getMessageId(msg) ?? i}`;
+              activeWorkerReportText = part.text.trim().slice(0, 6000);
+              alignerRejected = false;
               activeReturnSessionID = sesId;
               turnReturnedSessionsSinceDispatch.add(sesId);
               activeReturnAgent = agent === "unknown" ? "designer/fixer" : agent;
@@ -649,6 +671,8 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
           pendingBackgroundIds.delete(sesId);
           if (sesId !== activeReturnSessionID || dispatchedSinceLastReturn) {
             activeReturnWatermark = `job:${sesId}:${getMessageId(msg) ?? i}`;
+            activeWorkerReportText = part.text.trim().slice(0, 6000);
+            alignerRejected = false;
             activeReturnSessionID = sesId;
             activeReturnAgent = "designer/fixer";
             activeReturnIdx = i;
@@ -673,6 +697,13 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
         if (info.kind === "v2-call" || info.kind === "v1-tool" || isBackgroundLaunch) {
           turnReturnedSessionsSinceDispatch.clear();
           dispatchedSinceLastReturn = true;
+          if (WRITER_AGENTS.has(target)) alignerRejected = false;
+        }
+        if (target === "aligner") {
+          if (activeReturnWatermark) windowClosedByAction = true;
+          const alignerText = String(info.output || "");
+          if (/\[ALIGN_REJECT\]/i.test(alignerText)) alignerRejected = true;
+          if (/\[ALIGN_PASS\]/i.test(alignerText)) alignerRejected = false;
         }
         const isForegroundCompleted =
           effectiveInput?.background === false &&
@@ -684,6 +715,8 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
           if (activeReturnSessionID) turnReturnedSessionsSinceDispatch.add(activeReturnSessionID);
           activeReturnAgent = target;
           activeReturnWatermark = `fg:${info.id ?? i}`;
+          activeWorkerReportText = String(info.output || "").trim().slice(0, 6000);
+          alignerRejected = false;
           activeReturnIdx = i;
           windowClosedByAction = false;
           dispatchedSinceLastReturn = false;
@@ -700,6 +733,9 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
   const withinCap = completedAuditWindowsInTurn > 0 && completedAuditWindowsInTurn <= maxWindows;
   return {
     inAuditWindow: Boolean(activeReturnWatermark) && !windowClosedByAction && withinCap,
+    userRawText,
+    workerReportText: activeWorkerReportText,
+    alignerRejected: Boolean(alignerRejected && activeReturnWatermark),
     watermark: activeReturnWatermark,
     returnedSessionID: activeReturnSessionID,
     returnedAgent: activeReturnAgent,
@@ -722,7 +758,7 @@ export function neutralizeDuplicateTaskNotifications(messages, duplicateNotifica
       setParts(messages[idx], [{
         type: "text",
         synthetic: true,
-        text: "<system-reminder>[aligns-gate: 重复的子任务完成通知已自动折叠忽略 — 该子任务在此前已回归并完成审稿，请勿重复截图或重复审稿，直接结束当前回复即可。]</system-reminder>"
+        text: "<system-reminder>[aligns-gate: 重复的子任务完成通知已自动折叠忽略，请勿重复审稿，直接结束当前回复。]</system-reminder>"
       }]);
     }
   }
@@ -809,13 +845,32 @@ export function dehydrateClosedAuditWindows(messages, closedWindows) {
   }
 }
 
-function buildReminderText(mandateContent, state) {
+function buildReminderText(mandateContent, state, config = {}) {
+  if (state.alignerRejected) {
+    const sessionHint = state.returnedSessionID
+      ? `, sessionID="${state.returnedSessionID}"`
+      : "";
+    return `<system-reminder>
+[ALIGNS.md — @aligner 审稿未通过]
+请立即调用 \`subagent(agent="${state.returnedAgent || "fixer"}"${sessionHint})\`，将 @aligner 指出的缺陷原样打回原会话返工。
+</system-reminder>`;
+  }
+  if (config.useAligner !== false) {
+    const targetHint = state.returnedSessionID
+      ? `刚交卷: @${state.returnedAgent} · sessionID: \`${state.returnedSessionID}\``
+      : `刚交卷: @${state.returnedAgent}`;
+    return `<system-reminder>
+[ALIGNS.md — 第一棒：派发 @aligner 独立审稿 · ${state.windowCount}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN}]
+${targetHint}
+请调用 \`subagent(agent="aligner", background=false, description="Audit @${state.returnedAgent}")\` 独立审稿。插件会自动注入用户原话、Worker 报告与 ALIGNS.md 红线；prompt 只需传预览地址或测试命令，勿复述长文或自行截图。
+</system-reminder>`;
+  }
   const targetHint = state.returnedSessionID
-    ? `刚回归的子任务: @${state.returnedAgent} (sessionID: \`${state.returnedSessionID}\` — 如发现假/糊弄/不对味，请直接沿用此 sessionID 打回回炉)`
-    : `刚回归的子任务: @${state.returnedAgent}`;
+    ? `刚交卷: @${state.returnedAgent} · sessionID: \`${state.returnedSessionID}\`，不达标请直接复用此 sessionID 打回返工`
+    : `刚交卷: @${state.returnedAgent}`;
 
   return `<system-reminder>
-[ALIGNS.md — 审稿窗口期已激活 (${state.windowCount}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN})]
+[ALIGNS.md — 审稿窗口期已激活 · ${state.windowCount}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN}]
 ${targetHint}
 
 ${mandateContent}
@@ -831,13 +886,13 @@ export function applyMandateGateToV1Messages(messages, workDir) {
   dehydrateClosedAuditWindows(messages, state.closedWindows);
   neutralizeDuplicateTaskNotifications(messages, state.duplicateNotificationIndices);
 
-  if (!state.inAuditWindow) return false;
+  if (!state.inAuditWindow && !state.alignerRejected) return false;
 
   const mandateContent = readBoundedMandate(workDir, state.returnedAgent);
   if (!mandateContent) return false;
 
   const sessionID = getSessionId(messages[messages.length - 1], "default");
-  const text = buildReminderText(mandateContent, state);
+  const text = buildReminderText(mandateContent, state, config);
 
   messages.push({
     info: {
@@ -881,12 +936,12 @@ export function applyMandateGateToV2Event(event, workDir) {
   dehydrateClosedAuditWindows(messages, state.closedWindows);
   neutralizeDuplicateTaskNotifications(messages, state.duplicateNotificationIndices);
 
-  if (!state.inAuditWindow) return false;
+  if (!state.inAuditWindow && !state.alignerRejected) return false;
 
   const mandateContent = readBoundedMandate(workDir, state.returnedAgent);
   if (!mandateContent) return false;
 
-  const text = buildReminderText(mandateContent, state);
+  const text = buildReminderText(mandateContent, state, config);
 
   messages.push({
     id: `mandate-gate-${event.sessionID ?? "default"}`,
@@ -906,6 +961,60 @@ export function applyMandateGateToV2Event(event, workDir) {
     ]
   });
   return true;
+}
+
+export function enrichAlignerSubagentCall(event, workDir) {
+  const toolName = String(event?.tool ?? "").toLowerCase();
+  if (toolName !== "subagent" && toolName !== "task") return false;
+  if (getSubagentTarget(event.input) !== "aligner") return false;
+  event.input.background = false;
+  if (typeof event.input.prompt === "string" && event.input.prompt.includes("【1. 用户原始原话")) return false;
+  const cached = event.sessionID ? lastSessionState.get(event.sessionID) : null;
+  const workerAgent = cached?.returnedAgent || "designer";
+  const mandateContent = readBoundedMandate(workDir || cached?.workDir, workerAgent);
+  const basePrompt = typeof event.input.prompt === "string" && event.input.prompt.trim()
+    ? event.input.prompt.trim()
+    : "请核验刚才 Worker 的改动是否对齐人类意图与 ALIGNS.md 红线。";
+  const sessionLabel = cached?.returnedSessionID ? ` · sessionID: ${cached.returnedSessionID}` : "";
+  event.input.prompt = `${basePrompt}
+
+---
+### 【1. 用户原始原话】
+${cached?.userRawText || "未捕获到本轮用户原话"}
+
+### 【2. Worker 交卷报告 · @${workerAgent}${sessionLabel}】
+${cached?.workerReportText || "未捕获到 Worker 报告原文"}
+
+### 【3. ALIGNS.md 专属验收红线 · @${workerAgent}】
+${mandateContent || "无额外 ALIGNS.md 规则，请按用户原话核验"}
+
+---
+请按以上三项独立核验：前端改动须打开浏览器实机截图桌面端与移动端并点按核心交互；后端或逻辑改动须运行真实测试或构建命令。
+回复开头须给出结论标签：
+- 全部达标：\`[ALIGN_PASS]\` + 简短核验凭据
+- 存在未达标项：\`[ALIGN_REJECT]\` + 具体缺陷与复现位置`;
+  return true;
+}
+
+export function ensureAlignerAgentConfigured(configPath = path.join(os.homedir(), ".config", "opencode", "oh-my-opencode-slim.json")) {
+  if (!fs.existsSync(configPath)) return false;
+  const data = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  if (data && typeof data === "object" && !data.agents?.aligner) {
+    data.agents = {
+      ...(data.agents || {}),
+      aligner: {
+        model: "openai/gpt-6.1-sol",
+        variant: "high",
+        permission: { "*": "allow" },
+        skills: ["chrome-devtools-cli"],
+        mcps: [],
+        prompt: "你是独立质检员 @aligner，不负责实现或修改代码。以用户原话和 ALIGNS.md 为验收准绳，独立运行真实测试；前端必须浏览器截图桌面端和移动端并验证核心交互。回复开头必须给出 [ALIGN_PASS] 或 [ALIGN_REJECT]，附核验凭据或具体缺陷及复现位置。"
+      }
+    };
+    fs.writeFileSync(configPath, `${JSON.stringify(data, null, 2)}\n`);
+    return true;
+  }
+  return false;
 }
 
 function extractTargetPathsFromToolInput(toolName, input) {
@@ -961,13 +1070,13 @@ export function enforceOrchestratorRouterGuard(event, workDir) {
 
   const prev = event.sessionID ? lastSessionState.get(event.sessionID)?.lastSessionByAgent : null;
   const hintParts = [];
-  if (prev?.designer) hintParts.push(`@designer (sessionID: \`${prev.designer}\`)`);
-  if (prev?.fixer) hintParts.push(`@fixer (sessionID: \`${prev.fixer}\`)`);
-  const reuseHint = hintParts.length > 0 ? ` 请优先复用热会话: ${hintParts.join(" 或 ")}。` : "";
+  if (prev?.designer) hintParts.push(`@designer · sessionID: \`${prev.designer}\``);
+  if (prev?.fixer) hintParts.push(`@fixer · sessionID: \`${prev.fixer}\``);
+  const reuseHint = hintParts.length > 0 ? ` 请优先复用会话：${hintParts.join(" 或 ")}。` : "";
   const targetLabel = codePaths.join(", ");
 
   throw new Error(
-    `[审慎写入确认] 主控原则上不应直接修改业务源码文件 (${targetLabel})，常规功能与 UI 改动请调用 subagent 派发给 @fixer 或 @designer！${reuseHint}\n💡 若当前仅是几行以内的极小修补、确认必须亲自修改，请直接对该文件再次调用一次 ${toolName}，下一次将自动放行（放行后立即重置为拦截态）。`
+    `[审慎写入确认] 主控不应直接修改业务源码 ${targetLabel}，常规功能与 UI 改动请调用 subagent 派发给 @fixer 或 @designer。${reuseHint}\n若确属几行内的极小修补，再次对该文件调用 ${toolName} 即可放行一次，放行后立即恢复拦截。`
   );
 }
 
@@ -988,7 +1097,7 @@ export async function maybeEmitIntentAlignNotice(ctx, sessionID, state, workDir)
   await ctx.session.synthetic({
     sessionID,
     id: messageID,
-    text: `${INTENT_NOTICE_MARKER}\n[ALIGNS.md — 人类意图对齐审稿窗口 (${state.windowCount}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN}): @${state.returnedAgent}]`,
+    text: `${INTENT_NOTICE_MARKER}\n[ALIGNS.md — 人类意图对齐审稿窗口 · ${state.windowCount}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN} · @${state.returnedAgent}]`,
     description: "aligns-gate: 人类意图对齐",
     metadata: { [OMO_BOARD_KEY]: true, [MANDATE_GATE_KEY]: true },
     delivery: "steer",
@@ -1069,20 +1178,20 @@ async function maybeSendPostAuditSplitBaton(ctx, sessionID) {
 
     const topList = monoliths
       .slice(0, 5)
-      .map((m, idx) => `${idx + 1}. \`${m.file}\` (${m.lines} 行)`)
+      .map((m, idx) => `${idx + 1}. \`${m.file}\` · ${m.lines} 行`)
       .join("\n");
     const topTarget = monoliths[0];
     const fixerHint = cached.lastSessionByAgent?.fixer
-      ? `（可复用 @fixer sessionID: \`${cached.lastSessionByAgent.fixer}\` 或新建会话）`
+      ? `，可复用 @fixer sessionID \`${cached.lastSessionByAgent.fixer}\` 或新建会话`
       : "";
 
     const text = `<system-reminder>
 [ALIGNS.md — 巨石文件拆分]
-上一棒审稿已正常结束（审稿期的截图与工具长输出已自动脱水释放）。
-全仓扫描发现以下源码文件超过 ${config.maxLines} 行硬红线：
+上一棒审稿已结束，审稿期的截图与工具长输出已自动清理。
+扫描发现以下源码文件超过 ${config.maxLines} 行红线：
 ${topList}
 
-请立即派发 \`subagent(agent="fixer")\`${fixerHint}，在保持现有业务行为与测试 100% 不变的前提下，将榜首的 \`${topTarget.file}\` (${topTarget.lines} 行) 按高内聚职责拆分为多个 \`< ${config.maxLines} 行\` 的子模块并跑通验证！
+请派发 \`subagent(agent="fixer")\`${fixerHint}，在保持现有行为与测试不变的前提下，将 \`${topTarget.file}\` 按高内聚职责拆分为多个小于 ${config.maxLines} 行的模块并跑通验证。
 </system-reminder>
 <!-- SLIM_INTERNAL_INITIATOR -->`;
 
@@ -1144,6 +1253,7 @@ export default {
     }
   }),
   setup: async (ctx) => {
+    try { ensureAlignerAgentConfigured(); } catch {}
     installSyntheticTaskDeduper(ctx);
     const disposers = [];
 
@@ -1151,6 +1261,9 @@ export default {
       try {
         const beforeReg = await ctx.tool.hook("execute.before", async (event) => {
           const toolName = String(event.tool ?? "").toLowerCase();
+          if (toolName === "subagent" || toolName === "task") {
+            enrichAlignerSubagentCall(event, await resolveSessionWorkDir(ctx, event.sessionID));
+          }
           if ((toolName === "subagent" || toolName === "task") && event.input?.sessionID) {
             const parentId = event.sessionID ?? "default";
             const childId = event.input.sessionID;
