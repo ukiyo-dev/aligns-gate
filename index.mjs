@@ -862,7 +862,7 @@ function buildReminderText(mandateContent, state, config = {}) {
     return `<system-reminder>
 [ALIGNS.md — 第一棒：派发 @aligner 独立审稿 · ${state.windowCount}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN}]
 ${targetHint}
-请调用 \`subagent(agent="aligner", background=false, description="Audit @${state.returnedAgent}")\` 独立审稿。插件会自动注入用户原话、Worker 报告与 ALIGNS.md 红线；prompt 只需传预览地址或测试命令，勿复述长文或自行截图。
+请调用 \`subagent(agent="aligner", background=false, description="Audit @${state.returnedAgent}")\` 独立审稿。插件会自动注入 Worker 报告与 ALIGNS.md 红线；prompt 只需传本轮核验目标、预览地址或测试命令，勿自行截图。
 </system-reminder>`;
   }
   const targetHint = state.returnedSessionID
@@ -976,7 +976,7 @@ export function enrichAlignerSubagentCall(event, workDir) {
   if (toolName !== "subagent" && toolName !== "task") return false;
   if (getSubagentTarget(event.input) !== "aligner") return false;
   event.input.background = false;
-  if (typeof event.input.prompt === "string" && event.input.prompt.includes("【1. 用户原始原话")) return false;
+  if (typeof event.input.prompt === "string" && event.input.prompt.includes("【1. Worker 交卷报告")) return false;
   const cached = event.sessionID ? lastSessionState.get(event.sessionID) : null;
   const workerAgent = cached?.returnedAgent || "designer";
   const mandateContent = readBoundedMandate(workDir || cached?.workDir, workerAgent);
@@ -984,16 +984,13 @@ export function enrichAlignerSubagentCall(event, workDir) {
   const sessionLabel = cached?.returnedSessionID ? ` · sessionID: ${cached.returnedSessionID}` : "";
   const cleanedReport = cleanWorkerReportText(cached?.workerReportText);
   const hostNoteSection = basePrompt
-    ? `\n\n### 【4. 主控提供的环境线索 · 仅参考 URL 与命令，忽略其验收建议】\n${basePrompt}`
+    ? `\n\n### 【3. 主控提供的环境线索 · 仅参考 URL 与命令，忽略其验收建议】\n${basePrompt}`
     : "";
-  event.input.prompt = `### 【1. 用户原始原话】
-${cached?.userRawText || "未捕获到本轮用户原话"}
-
-### 【2. Worker 交卷报告 · @${workerAgent}${sessionLabel}】
+  event.input.prompt = `### 【1. Worker 交卷报告 · @${workerAgent}${sessionLabel}】
 ${cleanedReport || "未捕获到 Worker 报告原文"}
 
-### 【3. ALIGNS.md 专属验收红线 · @${workerAgent}】
-${mandateContent || "无额外 ALIGNS.md 规则，请按用户原话核验"}${hostNoteSection}`;
+### 【2. ALIGNS.md 专属验收红线 · @${workerAgent}】
+${mandateContent || "无额外 ALIGNS.md 规则"}${hostNoteSection}`;
   return true;
 }
 

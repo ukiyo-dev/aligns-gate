@@ -191,11 +191,12 @@ test("aligner calls receive the original user, worker report, role mandate, and 
     const event = { tool, sessionID: "ses_dossier", input: { agent: "aligner", background: true, prompt: "Run npm test" } };
     assert.equal(enrichAlignerSubagentCall(event), true);
     assert.equal(event.input.background, false);
-    assert.match(event.input.prompt, /【1\. 用户原始原话】\nImplement this/);
-    assert.match(event.input.prompt, /【2\. Worker 交卷报告 · @fixer · sessionID: ses_dossier_worker】/);
+    assert.doesNotMatch(event.input.prompt, /用户原始原话/);
+    assert.match(event.input.prompt, /【1\. Worker 交卷报告 · @fixer · sessionID: ses_dossier_worker】/);
     assert.match(event.input.prompt, /Original worker report/);
-    assert.match(event.input.prompt, /【3\. ALIGNS\.md 专属验收红线 · @fixer】/);
+    assert.match(event.input.prompt, /【2\. ALIGNS\.md 专属验收红线 · @fixer】/);
     assert.match(event.input.prompt, /Run actual tests/);
+    assert.match(event.input.prompt, /【3\. 主控提供的环境线索[\s\S]*Run npm test/);
     assert.doesNotMatch(event.input.prompt, /Visual rule|Injected reminder/);
     const prompt = event.input.prompt;
     event.input.background = true;
