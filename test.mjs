@@ -126,7 +126,7 @@ test("context hook emits intent notices after transforming", async () => {
 });
 
 test("both split reminder headers are recognized without opening a new user turn", () => {
-  for (const header of ["巨石文件拆分", "巨石文件拆分第二棒"]) {
+  for (const header of ["巨石文件拆分", "巨石文件拆分后续轮次"]) {
     const messages = [user(), completion("ses_split"), { role: "user", content: [{ type: "text", text: `[ALIGNS.md — ${header}]` }] }];
     const state = analyzeAuditWindow(messages);
     assert.equal(state.turnId, "human");
@@ -186,7 +186,7 @@ test("aligner calls receive the original user, worker report, role mandate, and 
   messages[1].content[0].state.output += "\nOriginal worker report";
   messages[0].content.push({ type: "text", synthetic: true, text: "Injected reminder", metadata: { "oh-my-opencode-slim.orchestratorMandateGate": true } });
   assert.equal(applyMandateGateToV2Event({ sessionID: "ses_dossier", messages }, scopedDir), true);
-  assert.match(messages.at(-1).content[0].text, /第一棒：派发 @aligner/);
+  assert.match(messages.at(-1).content[0].text, /派发 @aligner 独立审稿/);
   for (const tool of ["subagent", "task"]) {
     const event = { tool, sessionID: "ses_dossier", input: { agent: "aligner", background: true, prompt: "Run npm test" } };
     assert.equal(enrichAlignerSubagentCall(event), true);

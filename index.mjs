@@ -338,8 +338,7 @@ function isInternalSyntheticMessage(msg) {
       p?.metadata?.[SPLIT_INITIATOR_KEY] === true ||
       (typeof p?.text === "string" &&
         (p.text.includes("<!-- SLIM_INTERNAL_INITIATOR -->") ||
-          p.text.includes("[ALIGNS.md — 巨石文件拆分]") ||
-          p.text.includes("[ALIGNS.md — 巨石文件拆分第二棒]") ||
+           p.text.includes("[ALIGNS.md — 巨石文件拆分") ||
           /^\s*<subagent-update\b/i.test(p.text)))
   );
 }
@@ -615,7 +614,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
         msgParts.some(
           (p) =>
             p?.metadata?.[SPLIT_INITIATOR_KEY] === true ||
-            (typeof p?.text === "string" && (p.text.includes("[ALIGNS.md — 巨石文件拆分]") || p.text.includes("[ALIGNS.md — 巨石文件拆分第二棒]")))
+            (typeof p?.text === "string" && p.text.includes("[ALIGNS.md — 巨石文件拆分"))
         )
       ) {
         hasSplitInitiatorInTurn = true;
@@ -872,7 +871,7 @@ function buildReminderText(mandateContent, state, config = {}) {
       : `刚交卷: @${state.returnedAgent}`;
     const auditTag = String(state.returnedSessionID || state.watermark || "").slice(-5) || "run";
     return `<system-reminder>
-[ALIGNS.md — 第一棒：派发 @aligner 独立审稿 · ${state.windowCount}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN}]
+[ALIGNS.md — 派发 @aligner 独立审稿 · ${state.windowCount}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN}]
 ${targetHint}
 请调用 \`subagent(agent="aligner"${alignerSessionArg}, background=false, description="Audit @${state.returnedAgent} ${auditTag}-${state.windowCount}")\` 独立审稿。插件会自动注入 Worker 报告与 ALIGNS.md 红线；prompt 只需传本轮核验目标、预览地址或测试命令，勿自行截图。
 </system-reminder>`;
@@ -1184,7 +1183,7 @@ async function maybeSendPostAuditSplitBaton(ctx, sessionID) {
             if (
               entry?.type === "synthetic" &&
               (entry?.metadata?.[SPLIT_INITIATOR_KEY] === true ||
-                (typeof entry?.text === "string" && (entry.text.includes("[ALIGNS.md — 巨石文件拆分]") || entry.text.includes("[ALIGNS.md — 巨石文件拆分第二棒]"))))
+                (typeof entry?.text === "string" && entry.text.includes("[ALIGNS.md — 巨石文件拆分")))
             ) {
               splitTriggeredTurns.add(cached.turnId);
               return false;
@@ -1216,7 +1215,7 @@ async function maybeSendPostAuditSplitBaton(ctx, sessionID) {
 
     const text = `<system-reminder>
 [ALIGNS.md — 巨石文件拆分]
-上一棒审稿已结束，审稿期的截图与工具长输出已自动清理。
+上一轮审稿已结束，审稿期的截图与工具长输出已自动清理。
 扫描发现以下源码文件超过 ${config.maxLines} 行红线：
 ${topList}
 
