@@ -454,7 +454,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
     }
   }
   if (lastUserIdx === -1) {
-    return { inAuditWindow: false, launchedBeforeLatestUser: false, userRawText: "", workerReportText: "", alignerRejected: false, alignerSessionID: null, closedWindows: [], pendingBackgroundIds: new Set(), duplicateNotificationIndices: [], returnedSessionsSinceDispatch: [], maxWindows };
+    return { inAuditWindow: false, launchedBeforeLatestUser: false, userRawText: "", workerReportText: "", alignerRejected: false, alignerSessionID: null, auditRound: 0, alignerAuditCount: 0, closedWindows: [], pendingBackgroundIds: new Set(), duplicateNotificationIndices: [], returnedSessionsSinceDispatch: [], maxWindows };
   }
 
   const userRawText = extractMessagePlainText(messages[lastUserIdx], 4000);
@@ -613,6 +613,8 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
   let activeLaunchedBeforeLatestUser = false;
   let windowClosedByAction = false;
   let completedAuditWindowsInTurn = 0;
+  let completedAlignerAuditsInTurn = 0;
+  let alignerCountedForCurrentWindow = false;
   let hasSplitInitiatorInTurn = false;
   let dispatchedSinceLastReturn = true;
   let turnAlignerSessionID = null;
@@ -664,6 +666,10 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
             const agent = partMetaAgent || sessionToAgent.get(sesId) || descToAgent.get(desc) || "unknown";
             if (agent === "aligner") {
               turnAlignerSessionID = sesId;
+              if (!alignerCountedForCurrentWindow) {
+                completedAlignerAuditsInTurn += 1;
+                alignerCountedForCurrentWindow = true;
+              }
               if (activeReturnWatermark) windowClosedByAction = true;
               if (/\[ALIGN_(?:REJECT|POLISH)\]/i.test(part.text)) alignerRejected = true;
               if (/\[ALIGN_PASS\]/i.test(part.text)) alignerRejected = false;
@@ -686,6 +692,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
               activeReturnIdx = i;
               windowClosedByAction = false;
               dispatchedSinceLastReturn = false;
+              alignerCountedForCurrentWindow = false;
               completedAuditWindowsInTurn += 1;
             }
           }
@@ -730,6 +737,10 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
           }
         }
         if (target === "aligner") {
+          if (!alignerCountedForCurrentWindow) {
+            completedAlignerAuditsInTurn += 1;
+            alignerCountedForCurrentWindow = true;
+          }
           if (activeReturnWatermark) windowClosedByAction = true;
           const alignerText = String(info.output || "");
           const alignerSesMatch = /sessionID[:=]\s*"?(ses_[A-Za-z0-9_-]+)"?/i.exec(alignerText) || /<(?:subagent\s+sessionID|task\s+id)="(ses_[A-Za-z0-9_-]+)"/i.exec(alignerText);
@@ -756,6 +767,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
           activeReturnIdx = i;
           windowClosedByAction = false;
           dispatchedSinceLastReturn = false;
+          alignerCountedForCurrentWindow = false;
           completedAuditWindowsInTurn += 1;
         } else if (activeReturnWatermark && (info.kind === "v2-call" || info.kind === "v1-tool" || isBackgroundLaunch)) {
           windowClosedByAction = true;
@@ -895,6 +907,7 @@ function buildReminderText(mandateContent, state, config = {}) {
 </system-reminder>`;
   }
   if (config.useAligner !== false) {
+    const round = state.auditRound ?? state.windowCount;
     const alignerSessionArg = state.alignerSessionID
       ? `, sessionID="${state.alignerSessionID}"`
       : "";
@@ -907,16 +920,16 @@ function buildReminderText(mandateContent, state, config = {}) {
         ? `, sessionID="${state.returnedSessionID}"`
         : "";
       return `<system-reminder>
-[ALIGNS.md — 派发 @aligner 独立审稿 · ${state.windowCount}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN}]
+[ALIGNS.md — 派发 @aligner 独立审稿 · ${round}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN}]
 ${targetHint}
 - 若用户最新消息有待补发的改动需求：请直接调用 \`subagent(agent="${state.returnedAgent}"${workerSessionArg})\` 补发新需求继续执行，暂不调 @aligner，等新需求跑完再统一审稿。
-- 若无需补发改动：请调用 \`subagent(agent="aligner"${alignerSessionArg}, background=false, description="Audit @${state.returnedAgent} ${auditTag}-${state.windowCount}")\` 独立审稿。
+- 若无需补发改动：请调用 \`subagent(agent="aligner"${alignerSessionArg}, background=false, description="Audit @${state.returnedAgent} ${auditTag}-${round}")\` 独立审稿。
 </system-reminder>`;
     }
     return `<system-reminder>
-[ALIGNS.md — 派发 @aligner 独立审稿 · ${state.windowCount}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN}]
+[ALIGNS.md — 派发 @aligner 独立审稿 · ${round}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN}]
 ${targetHint}
-请调用 \`subagent(agent="aligner"${alignerSessionArg}, background=false, description="Audit @${state.returnedAgent} ${auditTag}-${state.windowCount}")\` 独立审稿。插件会自动注入 Worker 报告与 ALIGNS.md 红线；prompt 只需传本轮核验目标、预览地址或测试命令，勿自行截图。
+请调用 \`subagent(agent="aligner"${alignerSessionArg}, background=false, description="Audit @${state.returnedAgent} ${auditTag}-${round}")\` 独立审稿。插件会自动注入 Worker 报告与 ALIGNS.md 红线；prompt 只需传本轮核验目标、预览地址或测试命令，勿自行截图。
 </system-reminder>`;
   }
   const targetHint = state.returnedSessionID
@@ -1032,7 +1045,8 @@ export function enrichAlignerSubagentCall(event, workDir) {
   event.input.background = false;
   const cached = event.sessionID ? lastSessionState.get(event.sessionID) : null;
   const maxRej = cached?.maxWindows ?? MAX_WINDOWS_PER_TURN;
-  if (cached && cached.windowCount > maxRej + 1) {
+  const currentRound = cached?.auditRound ?? cached?.windowCount ?? 1;
+  if (cached && currentRound > maxRej + 1) {
     throw new Error(
       `[审稿次数已封顶] 本轮已完成 ${maxRej + 1} 轮独立审稿与 ${maxRej} 次打回返工，已达单轮上限。请勿继续调用 @aligner，直接向用户汇总交付本轮改动。`
     );
@@ -1175,7 +1189,7 @@ export async function maybeEmitIntentAlignNotice(ctx, sessionID, state, workDir)
   await ctx.session.synthetic({
     sessionID,
     id: messageID,
-    text: `${INTENT_NOTICE_MARKER}\n[ALIGNS.md — 人类意图对齐审稿窗口 · ${state.windowCount}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN} · @${state.returnedAgent}]`,
+    text: `${INTENT_NOTICE_MARKER}\n[ALIGNS.md — 人类意图对齐审稿窗口 · ${state.auditRound ?? state.windowCount}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN} · @${state.returnedAgent}]`,
     description: "aligns-gate: 人类意图对齐",
     metadata: { [OMO_BOARD_KEY]: true, [MANDATE_GATE_KEY]: true },
     delivery: "steer",
