@@ -736,12 +736,13 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
     }
   }
 
-  const withinCap = completedAuditWindowsInTurn > 0 && completedAuditWindowsInTurn <= maxWindows;
+  const withinAuditCap = completedAuditWindowsInTurn > 0 && completedAuditWindowsInTurn <= maxWindows + 1;
+  const withinRejectCap = completedAuditWindowsInTurn > 0 && completedAuditWindowsInTurn <= maxWindows;
   return {
-    inAuditWindow: Boolean(activeReturnWatermark) && !windowClosedByAction && withinCap,
+    inAuditWindow: Boolean(activeReturnWatermark) && !windowClosedByAction && withinAuditCap,
     userRawText,
     workerReportText: activeWorkerReportText,
-    alignerRejected: Boolean(alignerRejected && activeReturnWatermark),
+    alignerRejected: Boolean(alignerRejected && activeReturnWatermark && withinRejectCap),
     alignerSessionID: turnAlignerSessionID,
     watermark: activeReturnWatermark,
     returnedSessionID: activeReturnSessionID,
