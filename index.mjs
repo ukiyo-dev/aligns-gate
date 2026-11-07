@@ -980,8 +980,6 @@ function cleanWorkerReportText(raw) {
   return raw
     .replace(/^\s*<(?:subagent|task)\b[^>]*>\r?\n?/i, "")
     .replace(/\r?\n?<\/(?:subagent|task)>\s*$/i, "")
-    .replace(/\r?\n?<verification>[\s\S]*?<\/verification>/gi, "")
-    .replace(/\r?\n#{1,4}\s*验证结果[\s\S]*$/i, "")
     .trim();
 }
 

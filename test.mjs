@@ -342,18 +342,18 @@ test("POLISH and REJECT bounce back identically in every round through the confi
   }
 });
 
-test("aligner dossier strips worker verification claims and outer tags in initial and repeat audits", () => {
+test("aligner dossier strips outer subagent/task tags while preserving full worker report", () => {
   for (const tag of ["task", "subagent"]) {
     for (const reaudit of [false, true]) {
       const notice = completion("ses_clean_worker", `clean_${tag}_${reaudit}`, tag);
-      notice.content[0].text = notice.content[0].text.replace("Done", "Implemented behavior\n<verification>SELF_REPORTED_XML\nAll tests passed</verification>\nMore changes\n### 验证结果\nSELF_REPORTED_MARKDOWN");
+      notice.content[0].text = notice.content[0].text.replace("Done", "Implemented behavior\n### 验证结果\nRan pnpm test");
       const messages = [user(), dispatch("ses_clean_worker"), notice];
       const parent = `ses_clean_${tag}_${reaudit}`;
       assert.equal(applyMandateGateToV2Event({ sessionID: parent, messages }, dir), true);
       const event = { tool: "subagent", sessionID: parent, input: { agent: "aligner", ...(reaudit ? { sessionID: "ses_clean_aligner" } : {}) } };
       assert.equal(enrichAlignerSubagentCall(event, dir), true);
-      assert.match(event.input.prompt, /Implemented behavior\nMore changes/);
-      assert.doesNotMatch(event.input.prompt, /<\/?(?:task|subagent|verification)\b|验证结果|SELF_REPORTED/);
+      assert.match(event.input.prompt, /Implemented behavior\n### 验证结果\nRan pnpm test/);
+      assert.doesNotMatch(event.input.prompt, /<\/?(?:task|subagent)\b/);
       if (reaudit) assert.match(event.input.prompt, /未达标项或打磨建议/);
     }
   }
