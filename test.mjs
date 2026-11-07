@@ -113,6 +113,44 @@ test("intent notice emits once per session/watermark with required metadata", as
   assert.equal(sent[0].metadata["oh-my-opencode-slim.orchestratorMandateGate"], true);
 });
 
+test("mid-flight user updates defer background audits without consuming a redispatch window", async () => {
+  assert.equal(analyzeAuditWindow([]).launchedBeforeLatestUser, false);
+  for (const tag of ["task", "subagent"]) {
+    for (const foreground of [false, true]) {
+      const launch = dispatch("ses_bg_pre");
+      launch.content[0].state.input.agent = "designer";
+      const messages = [user(), launch, {
+        ...user(), id: "human_midflight",
+        content: [{ type: "text", text: "Also update the layout" }]
+      }, completion("ses_bg_pre", `pre_${tag}_${foreground}`, tag)];
+      const state = analyzeAuditWindow(messages);
+      assert.equal(state.inAuditWindow, true);
+      assert.equal(state.launchedBeforeLatestUser, true);
+      assert.equal(state.windowCount, 1);
+      const sent = [];
+      const ctx = { directory: dir, session: { synthetic: async (payload) => sent.push(payload) } };
+      assert.equal(await maybeEmitIntentAlignNotice(ctx, "ses_midflight", state, dir), false);
+      assert.equal(sent.length, 0);
+      assert.equal(applyMandateGateToV2Event({ messages }, dir), true);
+      const reminder = messages.at(-1).content[0].text;
+      assert.match(reminder, /\[ALIGNS\.md — 派发 @aligner 独立审稿 · 1\/2\]/);
+      assert.ok(reminder.includes('- 若用户最新消息有待补发的改动需求：请直接调用 `subagent(agent="designer", sessionID="ses_bg_pre")` 补发新需求继续执行，暂不调 @aligner，等新需求跑完再统一审稿。'));
+      assert.ok(reminder.includes('- 若无需补发改动：请调用 `subagent(agent="aligner", background=false, description="Audit @designer g_pre-1")` 独立审稿。'));
+      assert.doesNotMatch(reminder, /检测到后台运行期间有用户新消息/);
+
+      stripMandateGate(messages);
+      const redispatch = dispatch("ses_bg_pre", !foreground);
+      redispatch.content[0].state.input.agent = "designer";
+      messages.push(redispatch);
+      if (!foreground) messages.push(completion("ses_bg_pre", `post_${tag}`, tag));
+      const updated = analyzeAuditWindow(messages);
+      assert.equal(updated.inAuditWindow, true);
+      assert.equal(updated.launchedBeforeLatestUser, false);
+      assert.equal(updated.windowCount, 1);
+    }
+  }
+});
+
 test("context hook emits intent notices after transforming", async () => {
   let hook;
   const sent = [];

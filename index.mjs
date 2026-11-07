@@ -454,7 +454,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
     }
   }
   if (lastUserIdx === -1) {
-    return { inAuditWindow: false, userRawText: "", workerReportText: "", alignerRejected: false, alignerSessionID: null, closedWindows: [], pendingBackgroundIds: new Set(), duplicateNotificationIndices: [], returnedSessionsSinceDispatch: [], maxWindows };
+    return { inAuditWindow: false, launchedBeforeLatestUser: false, userRawText: "", workerReportText: "", alignerRejected: false, alignerSessionID: null, closedWindows: [], pendingBackgroundIds: new Set(), duplicateNotificationIndices: [], returnedSessionsSinceDispatch: [], maxWindows };
   }
 
   const userRawText = extractMessagePlainText(messages[lastUserIdx], 4000);
@@ -462,6 +462,15 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
   const descToAgent = new Map();
   const callIdToAgent = new Map();
   const callIdToInput = new Map();
+  const sessionLastLaunchIdx = new Map();
+  const callIdToLaunchIdx = new Map();
+  const sessionLaunchIndices = new Map();
+  const recordLaunch = (sessionID, idx) => {
+    sessionLastLaunchIdx.set(sessionID, idx);
+    const indices = sessionLaunchIndices.get(sessionID) ?? [];
+    indices.push(idx);
+    sessionLaunchIndices.set(sessionID, indices);
+  };
   const lastSessionByAgent = { designer: null, fixer: null };
   let lastDispatchedAgent = "";
 
@@ -470,6 +479,9 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
       const info = extractToolCallInfo(part);
       if (!info) continue;
       if ((info.tool === "subagent" || info.tool === "task") && info.input && Object.keys(info.input).length > 0) {
+        if (info.id) callIdToLaunchIdx.set(info.id, i);
+        if (typeof info.input.sessionID === "string") recordLaunch(info.input.sessionID, i);
+        if (typeof info.metaSessionID === "string") recordLaunch(info.metaSessionID, i);
         if (info.id) callIdToInput.set(info.id, info.input);
         const agent = getSubagentTarget(info.input);
         if (agent) {
@@ -487,6 +499,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
         }
         if (info.output) {
           const m = /sessionID[:=]\s*"?(ses_[A-Za-z0-9_-]+)"?/.exec(info.output);
+          if (m) recordLaunch(m[1], i);
           if (m && agent) {
             sessionToAgent.set(m[1], agent);
             if (WRITER_AGENTS.has(agent)) lastSessionByAgent[agent] = m[1];
@@ -495,6 +508,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
       } else if (info.kind === "v2-result" && (info.tool === "subagent" || info.tool === "task")) {
         const agent = (info.id && callIdToAgent.get(info.id)) || lastDispatchedAgent;
         const m = /sessionID[:=]\s*"?(ses_[A-Za-z0-9_-]+)"?/.exec(info.output || "");
+        if (m) recordLaunch(m[1], (info.id && callIdToLaunchIdx.get(info.id)) ?? i);
         if (m && agent) {
           sessionToAgent.set(m[1], agent);
           if (WRITER_AGENTS.has(agent)) lastSessionByAgent[agent] = m[1];
@@ -596,6 +610,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
   let activeReturnSessionID = null;
   let activeReturnAgent = null;
   let activeReturnIdx = -1;
+  let activeLaunchedBeforeLatestUser = false;
   let windowClosedByAction = false;
   let completedAuditWindowsInTurn = 0;
   let hasSplitInitiatorInTurn = false;
@@ -654,6 +669,14 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
               if (/\[ALIGN_PASS\]/i.test(part.text)) alignerRejected = false;
             }
             if (!NON_WRITER_AGENTS.has(agent) && (WRITER_AGENTS.has(agent) || agent === "unknown")) {
+              const launchIdx = sessionLastLaunchIdx.get(sesId) ?? -1;
+              // A later redispatch must not retroactively reclassify this completion.
+              const completionLaunchIdx = launchIdx > i
+                ? (sessionLaunchIndices.get(sesId)?.filter((idx) => idx <= i).at(-1) ?? -1)
+                : launchIdx;
+              const launchedBeforeUser = completionLaunchIdx !== -1 && completionLaunchIdx < lastUserIdx;
+              if (activeLaunchedBeforeLatestUser && completedAuditWindowsInTurn > 0) completedAuditWindowsInTurn -= 1;
+              activeLaunchedBeforeLatestUser = launchedBeforeUser;
               activeReturnWatermark = `subagent:${sesId}:${getMessageId(msg) ?? i}`;
               activeWorkerReportText = part.text.trim().slice(0, 6000);
               alignerRejected = false;
@@ -698,7 +721,13 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
         if (info.kind === "v2-call" || info.kind === "v1-tool" || isBackgroundLaunch) {
           turnReturnedSessionsSinceDispatch.clear();
           dispatchedSinceLastReturn = true;
-          if (WRITER_AGENTS.has(target)) alignerRejected = false;
+          if (WRITER_AGENTS.has(target)) {
+            alignerRejected = false;
+            if (activeLaunchedBeforeLatestUser && completedAuditWindowsInTurn > 0) {
+              completedAuditWindowsInTurn -= 1;
+              activeLaunchedBeforeLatestUser = false;
+            }
+          }
         }
         if (target === "aligner") {
           if (activeReturnWatermark) windowClosedByAction = true;
@@ -715,6 +744,8 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
           ((info.kind === "v1-tool" && info.status === "completed") || info.kind === "v2-result");
 
         if (WRITER_AGENTS.has(target) && isForegroundCompleted) {
+          if (activeLaunchedBeforeLatestUser && completedAuditWindowsInTurn > 0) completedAuditWindowsInTurn -= 1;
+          activeLaunchedBeforeLatestUser = false;
           const sesMatch = /sessionID[:=]\s*"?(ses_[A-Za-z0-9_-]+)"?/.exec(info.output || "");
           activeReturnSessionID = sesMatch ? sesMatch[1] : effectiveInput?.sessionID ?? null;
           if (activeReturnSessionID) turnReturnedSessionsSinceDispatch.add(activeReturnSessionID);
@@ -746,6 +777,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
     watermark: activeReturnWatermark,
     returnedSessionID: activeReturnSessionID,
     returnedAgent: activeReturnAgent,
+    launchedBeforeLatestUser: activeLaunchedBeforeLatestUser,
     windowCount: completedAuditWindowsInTurn,
     maxWindows,
     returnedSessionsSinceDispatch: Array.from(turnReturnedSessionsSinceDispatch),
@@ -870,6 +902,17 @@ function buildReminderText(mandateContent, state, config = {}) {
       ? `刚交卷: @${state.returnedAgent} · sessionID: \`${state.returnedSessionID}\``
       : `刚交卷: @${state.returnedAgent}`;
     const auditTag = String(state.returnedSessionID || state.watermark || "").slice(-5) || "run";
+    if (state.launchedBeforeLatestUser) {
+      const workerSessionArg = state.returnedSessionID
+        ? `, sessionID="${state.returnedSessionID}"`
+        : "";
+      return `<system-reminder>
+[ALIGNS.md — 派发 @aligner 独立审稿 · ${state.windowCount}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN}]
+${targetHint}
+- 若用户最新消息有待补发的改动需求：请直接调用 \`subagent(agent="${state.returnedAgent}"${workerSessionArg})\` 补发新需求继续执行，暂不调 @aligner，等新需求跑完再统一审稿。
+- 若无需补发改动：请调用 \`subagent(agent="aligner"${alignerSessionArg}, background=false, description="Audit @${state.returnedAgent} ${auditTag}-${state.windowCount}")\` 独立审稿。
+</system-reminder>`;
+    }
     return `<system-reminder>
 [ALIGNS.md — 派发 @aligner 独立审稿 · ${state.windowCount}/${state.maxWindows ?? MAX_WINDOWS_PER_TURN}]
 ${targetHint}
@@ -1110,6 +1153,7 @@ export function enforceOrchestratorRouterGuard(event, workDir) {
 
 export async function maybeEmitIntentAlignNotice(ctx, sessionID, state, workDir) {
   if (!sessionID || !state?.inAuditWindow || !state?.watermark) return false;
+  if (state.launchedBeforeLatestUser) return false;
   if (typeof ctx?.session?.synthetic !== "function") return false;
   const instanceDir = ctx?.location?.directory || ctx?.directory;
   if (instanceDir && workDir && path.resolve(instanceDir) !== path.resolve(workDir)) return false;
