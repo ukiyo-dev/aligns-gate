@@ -1030,8 +1030,14 @@ export function enrichAlignerSubagentCall(event, workDir) {
   if (toolName !== "subagent" && toolName !== "task") return false;
   if (getSubagentTarget(event.input) !== "aligner") return false;
   event.input.background = false;
-  if (typeof event.input.prompt === "string" && (event.input.prompt.includes("【1. ALIGNS.md 专属验收红线") || event.input.prompt.includes("【1. Worker 返工交卷报告"))) return false;
   const cached = event.sessionID ? lastSessionState.get(event.sessionID) : null;
+  const maxRej = cached?.maxWindows ?? MAX_WINDOWS_PER_TURN;
+  if (cached && cached.windowCount > maxRej + 1) {
+    throw new Error(
+      `[审稿次数已封顶] 本轮已完成 ${maxRej + 1} 轮独立审稿与 ${maxRej} 次打回返工，已达单轮上限。请勿继续调用 @aligner，直接向用户汇总交付本轮改动。`
+    );
+  }
+  if (typeof event.input.prompt === "string" && (event.input.prompt.includes("【1. ALIGNS.md 专属验收红线") || event.input.prompt.includes("【1. Worker 返工交卷报告"))) return false;
   const reuseAlignerId = event.input.sessionID || event.input.task_id || cached?.alignerSessionID || null;
   const isReaudit = Boolean(reuseAlignerId);
   if (reuseAlignerId && !event.input.sessionID && !event.input.task_id) {
