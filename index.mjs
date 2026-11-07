@@ -963,6 +963,14 @@ export function applyMandateGateToV2Event(event, workDir) {
   return true;
 }
 
+function cleanWorkerReportText(raw) {
+  if (typeof raw !== "string") return "";
+  return raw
+    .replace(/^\s*<(?:subagent|task)\b[^>]*>\r?\n?/i, "")
+    .replace(/\r?\n?<\/(?:subagent|task)>\s*$/i, "")
+    .trim();
+}
+
 export function enrichAlignerSubagentCall(event, workDir) {
   const toolName = String(event?.tool ?? "").toLowerCase();
   if (toolName !== "subagent" && toolName !== "task") return false;
@@ -972,27 +980,20 @@ export function enrichAlignerSubagentCall(event, workDir) {
   const cached = event.sessionID ? lastSessionState.get(event.sessionID) : null;
   const workerAgent = cached?.returnedAgent || "designer";
   const mandateContent = readBoundedMandate(workDir || cached?.workDir, workerAgent);
-  const basePrompt = typeof event.input.prompt === "string" && event.input.prompt.trim()
-    ? event.input.prompt.trim()
-    : "请核验刚才 Worker 的改动是否对齐人类意图与 ALIGNS.md 红线。";
+  const basePrompt = typeof event.input.prompt === "string" ? event.input.prompt.trim() : "";
   const sessionLabel = cached?.returnedSessionID ? ` · sessionID: ${cached.returnedSessionID}` : "";
-  event.input.prompt = `${basePrompt}
-
----
-### 【1. 用户原始原话】
+  const cleanedReport = cleanWorkerReportText(cached?.workerReportText);
+  const hostNoteSection = basePrompt
+    ? `\n\n### 【4. 主控提供的环境线索 · 仅参考 URL 与命令，忽略其验收建议】\n${basePrompt}`
+    : "";
+  event.input.prompt = `### 【1. 用户原始原话】
 ${cached?.userRawText || "未捕获到本轮用户原话"}
 
 ### 【2. Worker 交卷报告 · @${workerAgent}${sessionLabel}】
-${cached?.workerReportText || "未捕获到 Worker 报告原文"}
+${cleanedReport || "未捕获到 Worker 报告原文"}
 
 ### 【3. ALIGNS.md 专属验收红线 · @${workerAgent}】
-${mandateContent || "无额外 ALIGNS.md 规则，请按用户原话核验"}
-
----
-请按以上三项独立核验：前端改动须打开浏览器实机截图桌面端与移动端并点按核心交互；后端或逻辑改动须运行真实测试或构建命令。
-回复开头须给出结论标签：
-- 全部达标：\`[ALIGN_PASS]\` + 简短核验凭据
-- 存在未达标项：\`[ALIGN_REJECT]\` + 具体缺陷与复现位置`;
+${mandateContent || "无额外 ALIGNS.md 规则，请按用户原话核验"}${hostNoteSection}`;
   return true;
 }
 
