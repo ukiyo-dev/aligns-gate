@@ -384,6 +384,7 @@ function isGenuineUserMessage(msg) {
 
 function extractToolCallInfo(part) {
   if (!part || typeof part !== "object") return null;
+  const isError = part.state?.status === "error" || part.status === "error" || part.isError === true || Boolean(part.state?.error || part.error);
   if (part.type === "tool") {
     const rawTool = part.tool ?? part.name ?? part.toolName ?? "";
     if (!rawTool) return null;
@@ -396,6 +397,7 @@ function extractToolCallInfo(part) {
     }
     return {
       kind: "v1-tool",
+      isError,
       tool: String(rawTool).toLowerCase(),
       id: part.id ?? part.callID,
       status: part.state?.status ?? part.status,
@@ -410,6 +412,7 @@ function extractToolCallInfo(part) {
     const input = part.args ?? part.input ?? {};
     return {
       kind: "v2-call",
+      isError,
       tool: String(name).toLowerCase(),
       id: part.toolCallId ?? part.id,
       input
@@ -431,6 +434,7 @@ function extractToolCallInfo(part) {
     }
     return {
       kind: "v2-result",
+      isError,
       tool: String(name).toLowerCase(),
       id: part.toolCallId ?? part.id,
       output
@@ -445,6 +449,19 @@ function getSubagentTarget(input) {
   return typeof raw === "string" ? raw.toLowerCase().trim() : "";
 }
 
+function inferAuditedWorker(texts, sessionToAgent, fallback) {
+  for (const text of texts) {
+    if (typeof text !== "string") continue;
+    const namedWorker = /@(designer|fixer)\b/i.exec(text);
+    if (namedWorker) return namedWorker[1].toLowerCase();
+    for (const sessionID of text.match(/ses_[A-Za-z0-9_-]+/g) ?? []) {
+      const agent = sessionToAgent.get(sessionID);
+      if (WRITER_AGENTS.has(agent)) return agent;
+    }
+  }
+  return fallback || "designer/fixer";
+}
+
 export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) {
   let lastUserIdx = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -454,7 +471,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
     }
   }
   if (lastUserIdx === -1) {
-    return { inAuditWindow: false, launchedBeforeLatestUser: false, userRawText: "", workerReportText: "", alignerRejected: false, alignerSessionID: null, auditRound: 0, alignerAuditCount: 0, closedWindows: [], pendingBackgroundIds: new Set(), duplicateNotificationIndices: [], returnedSessionsSinceDispatch: [], maxWindows };
+    return { inAuditWindow: false, launchedBeforeLatestUser: false, userRawText: "", workerReportText: "", alignerRejected: false, alignerSessionID: null, auditRound: 0, alignerAuditCount: 0, closedWindows: [], pendingBackgroundIds: new Set(), duplicateNotificationIndices: [], returnedSessionsSinceDispatch: [], workerBuckets: {}, maxWindows };
   }
 
   const userRawText = extractMessagePlainText(messages[lastUserIdx], 4000);
@@ -478,6 +495,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
     for (const part of getParts(messages[i])) {
       const info = extractToolCallInfo(part);
       if (!info) continue;
+      if (info.isError && (info.tool === "subagent" || info.tool === "task")) continue;
       if ((info.tool === "subagent" || info.tool === "task") && info.input && Object.keys(info.input).length > 0) {
         if (info.id) callIdToLaunchIdx.set(info.id, i);
         if (typeof info.input.sessionID === "string") recordLaunch(info.input.sessionID, i);
@@ -521,6 +539,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
   const closedWindows = [];
   let openWindowStart = -1;
   let openWindowSessionID = null;
+  let openWindowAgent = null;
   let hasDispatchSinceWindowOpen = true;
   const windowReturnedSessions = new Set();
 
@@ -561,6 +580,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
             }
             openWindowStart = i;
             openWindowSessionID = sesId;
+            openWindowAgent = agent === "unknown" ? "designer/fixer" : agent;
             windowReturnedSessions.add(sesId);
             hasDispatchSinceWindowOpen = false;
           }
@@ -570,6 +590,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
       const info = extractToolCallInfo(part);
       if (!info) continue;
       if (info.tool === "subagent" || info.tool === "task") {
+        if (info.isError) continue;
         const effectiveInput = (info.id && callIdToInput.get(info.id)) || info.input || {};
         const target = getSubagentTarget(effectiveInput) || (info.id && callIdToAgent.get(info.id)) || "";
         const isBackgroundLaunch = typeof info.output === "string" && info.output.includes("working in the background");
@@ -590,9 +611,14 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
           }
           openWindowStart = i;
           openWindowSessionID = fgSesId;
+          openWindowAgent = target;
           if (fgSesId) windowReturnedSessions.add(fgSesId);
           hasDispatchSinceWindowOpen = false;
-        } else if (openWindowStart !== -1 && (info.kind === "v2-call" || info.kind === "v1-tool" || isBackgroundLaunch)) {
+        } else if (openWindowStart !== -1 &&
+          (target === "aligner"
+            ? inferAuditedWorker([effectiveInput.description, effectiveInput.prompt, info.output], sessionToAgent, openWindowAgent) === openWindowAgent
+            : !WRITER_AGENTS.has(target) || target === openWindowAgent) &&
+          (info.kind === "v2-call" || info.kind === "v1-tool" || isBackgroundLaunch)) {
           closedWindows.push({ startIdx: openWindowStart, endIdx: i });
           openWindowStart = -1;
         }
@@ -614,13 +640,74 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
   let windowClosedByAction = false;
   let completedAuditWindowsInTurn = 0;
   let completedAlignerAuditsInTurn = 0;
-  let alignerCountedForCurrentWindow = false;
+  const workerBuckets = {};
+  const getWorkerBucket = (agentKey) => {
+    const key = WRITER_AGENTS.has(agentKey) ? agentKey : "designer/fixer";
+    return (workerBuckets[key] ??= {
+      alignerSessionID: null,
+      completedAudits: 0,
+      inReworkLoop: false,
+      alignerRejected: false,
+      workerReportText: "",
+      returnedSessionID: null,
+      watermark: null,
+      alignerCountedForCurrentWindow: false
+    });
+  };
+  const alignerSessionToWorker = new Map();
+  const alignerCallToWorker = new Map();
   let hasSplitInitiatorInTurn = false;
   let dispatchedSinceLastReturn = true;
   let turnAlignerSessionID = null;
   const pendingBackgroundIds = new Set();
   const turnReturnedSessionsSinceDispatch = new Set();
   const duplicateNotificationIndices = [];
+
+  const activateWorker = (agent, sessionID, report, watermark) => {
+    const key = WRITER_AGENTS.has(agent) ? agent : "designer/fixer";
+    const bucket = getWorkerBucket(key);
+    if (!bucket.inReworkLoop) {
+      bucket.alignerSessionID = null;
+      bucket.completedAudits = 0;
+    }
+    bucket.alignerRejected = false;
+    bucket.alignerCountedForCurrentWindow = false;
+    bucket.workerReportText = report;
+    bucket.returnedSessionID = sessionID;
+    bucket.watermark = watermark;
+    activeReturnAgent = key;
+    activeReturnSessionID = sessionID;
+    activeWorkerReportText = report;
+    activeReturnWatermark = watermark;
+    turnAlignerSessionID = bucket.alignerSessionID;
+    completedAlignerAuditsInTurn = bucket.completedAudits;
+    alignerRejected = false;
+  };
+  const recordAudit = (worker, sessionID, text) => {
+    const bucket = getWorkerBucket(worker);
+    if (sessionID) {
+      bucket.alignerSessionID = sessionID;
+      alignerSessionToWorker.set(sessionID, worker);
+    }
+    if (!bucket.alignerCountedForCurrentWindow) {
+      bucket.completedAudits += 1;
+      bucket.alignerCountedForCurrentWindow = true;
+    }
+    if (/\[ALIGN_(?:REJECT|POLISH)\]/i.test(text)) {
+      bucket.alignerRejected = true;
+      bucket.inReworkLoop = true;
+    }
+    if (/\[ALIGN_PASS\]/i.test(text)) {
+      bucket.alignerRejected = false;
+      bucket.inReworkLoop = false;
+    }
+    if (worker === activeReturnAgent || !activeReturnAgent) {
+      turnAlignerSessionID = bucket.alignerSessionID;
+      completedAlignerAuditsInTurn = bucket.completedAudits;
+      alignerRejected = bucket.alignerRejected;
+      if (activeReturnWatermark) windowClosedByAction = true;
+    }
+  };
 
   for (let i = lastUserIdx + 1; i < messages.length; i++) {
     const msg = messages[i];
@@ -665,14 +752,8 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
             const desc = (termMatch[3] ?? "").trim();
             const agent = partMetaAgent || sessionToAgent.get(sesId) || descToAgent.get(desc) || "unknown";
             if (agent === "aligner") {
-              turnAlignerSessionID = sesId;
-              if (!alignerCountedForCurrentWindow) {
-                completedAlignerAuditsInTurn += 1;
-                alignerCountedForCurrentWindow = true;
-              }
-              if (activeReturnWatermark) windowClosedByAction = true;
-              if (/\[ALIGN_(?:REJECT|POLISH)\]/i.test(part.text)) alignerRejected = true;
-              if (/\[ALIGN_PASS\]/i.test(part.text)) alignerRejected = false;
+              const worker = inferAuditedWorker([desc, part.text], sessionToAgent, alignerSessionToWorker.get(sesId) || activeReturnAgent);
+              recordAudit(worker, sesId, part.text);
             }
             if (!NON_WRITER_AGENTS.has(agent) && (WRITER_AGENTS.has(agent) || agent === "unknown")) {
               const launchIdx = sessionLastLaunchIdx.get(sesId) ?? -1;
@@ -683,16 +764,11 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
               const launchedBeforeUser = completionLaunchIdx !== -1 && completionLaunchIdx < lastUserIdx;
               if (activeLaunchedBeforeLatestUser && completedAuditWindowsInTurn > 0) completedAuditWindowsInTurn -= 1;
               activeLaunchedBeforeLatestUser = launchedBeforeUser;
-              activeReturnWatermark = `subagent:${sesId}:${getMessageId(msg) ?? i}`;
-              activeWorkerReportText = part.text.trim().slice(0, 6000);
-              alignerRejected = false;
-              activeReturnSessionID = sesId;
+              activateWorker(agent, sesId, part.text.trim().slice(0, 6000), `subagent:${sesId}:${getMessageId(msg) ?? i}`);
               turnReturnedSessionsSinceDispatch.add(sesId);
-              activeReturnAgent = agent === "unknown" ? "designer/fixer" : agent;
               activeReturnIdx = i;
               windowClosedByAction = false;
               dispatchedSinceLastReturn = false;
-              alignerCountedForCurrentWindow = false;
               completedAuditWindowsInTurn += 1;
             }
           }
@@ -701,11 +777,8 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
           const sesId = taskMatch ? taskMatch[1] : `job-${i}`;
           pendingBackgroundIds.delete(sesId);
           if (sesId !== activeReturnSessionID || dispatchedSinceLastReturn) {
-            activeReturnWatermark = `job:${sesId}:${getMessageId(msg) ?? i}`;
-            activeWorkerReportText = part.text.trim().slice(0, 6000);
-            alignerRejected = false;
-            activeReturnSessionID = sesId;
-            activeReturnAgent = "designer/fixer";
+            const worker = WRITER_AGENTS.has(partMetaAgent) ? partMetaAgent : sessionToAgent.get(sesId) || inferAuditedWorker([part.text], sessionToAgent);
+            activateWorker(worker, sesId, part.text.trim().slice(0, 6000), `job:${sesId}:${getMessageId(msg) ?? i}`);
             activeReturnIdx = i;
             windowClosedByAction = false;
             dispatchedSinceLastReturn = false;
@@ -718,6 +791,7 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
       if (!info) continue;
 
       if (info.tool === "subagent" || info.tool === "task") {
+        if (info.isError) continue;
         const effectiveInput = (info.id && callIdToInput.get(info.id)) || info.input || {};
         const target = getSubagentTarget(effectiveInput) || (info.id && callIdToAgent.get(info.id)) || "";
         const isBackgroundLaunch = typeof info.output === "string" && info.output.includes("working in the background");
@@ -729,26 +803,24 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
           turnReturnedSessionsSinceDispatch.clear();
           dispatchedSinceLastReturn = true;
           if (WRITER_AGENTS.has(target)) {
-            alignerRejected = false;
-            if (activeLaunchedBeforeLatestUser && completedAuditWindowsInTurn > 0) {
+            getWorkerBucket(target).alignerRejected = false;
+            if (target === activeReturnAgent || !activeReturnAgent) alignerRejected = false;
+            if (target === activeReturnAgent && activeLaunchedBeforeLatestUser && completedAuditWindowsInTurn > 0) {
               completedAuditWindowsInTurn -= 1;
               activeLaunchedBeforeLatestUser = false;
             }
           }
         }
         if (target === "aligner") {
-          if (!alignerCountedForCurrentWindow) {
-            completedAlignerAuditsInTurn += 1;
-            alignerCountedForCurrentWindow = true;
-          }
-          if (activeReturnWatermark) windowClosedByAction = true;
           const alignerText = String(info.output || "");
           const alignerSesMatch = /sessionID[:=]\s*"?(ses_[A-Za-z0-9_-]+)"?/i.exec(alignerText) || /<(?:subagent\s+sessionID|task\s+id)="(ses_[A-Za-z0-9_-]+)"/i.exec(alignerText);
-          if (alignerSesMatch) turnAlignerSessionID = alignerSesMatch[1];
-          else if (typeof effectiveInput?.sessionID === "string") turnAlignerSessionID = effectiveInput.sessionID;
-          else if (typeof info.metaSessionID === "string") turnAlignerSessionID = info.metaSessionID;
-          if (/\[ALIGN_(?:REJECT|POLISH)\]/i.test(alignerText)) alignerRejected = true;
-          if (/\[ALIGN_PASS\]/i.test(alignerText)) alignerRejected = false;
+          const alignerSessionID = alignerSesMatch?.[1] || effectiveInput?.sessionID || info.metaSessionID;
+          const worker = inferAuditedWorker(
+            [effectiveInput.description, effectiveInput.prompt, alignerText], sessionToAgent,
+            (info.id && alignerCallToWorker.get(info.id)) || alignerSessionToWorker.get(alignerSessionID) || activeReturnAgent
+          );
+          if (info.id) alignerCallToWorker.set(info.id, worker);
+          recordAudit(worker, alignerSessionID, alignerText);
         }
         const isForegroundCompleted =
           effectiveInput?.background === false &&
@@ -758,18 +830,16 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
           if (activeLaunchedBeforeLatestUser && completedAuditWindowsInTurn > 0) completedAuditWindowsInTurn -= 1;
           activeLaunchedBeforeLatestUser = false;
           const sesMatch = /sessionID[:=]\s*"?(ses_[A-Za-z0-9_-]+)"?/.exec(info.output || "");
-          activeReturnSessionID = sesMatch ? sesMatch[1] : effectiveInput?.sessionID ?? null;
+          activateWorker(target, sesMatch ? sesMatch[1] : effectiveInput?.sessionID ?? null,
+            String(info.output || "").trim().slice(0, 6000), `fg:${info.id ?? i}`);
           if (activeReturnSessionID) turnReturnedSessionsSinceDispatch.add(activeReturnSessionID);
-          activeReturnAgent = target;
-          activeReturnWatermark = `fg:${info.id ?? i}`;
-          activeWorkerReportText = String(info.output || "").trim().slice(0, 6000);
-          alignerRejected = false;
           activeReturnIdx = i;
           windowClosedByAction = false;
           dispatchedSinceLastReturn = false;
-          alignerCountedForCurrentWindow = false;
           completedAuditWindowsInTurn += 1;
-        } else if (activeReturnWatermark && (info.kind === "v2-call" || info.kind === "v1-tool" || isBackgroundLaunch)) {
+        } else if (activeReturnWatermark && target !== "aligner" &&
+          (!WRITER_AGENTS.has(target) || target === activeReturnAgent) &&
+          (info.kind === "v2-call" || info.kind === "v1-tool" || isBackgroundLaunch)) {
           windowClosedByAction = true;
         }
       } else if (info.tool === "question" && activeReturnWatermark) {
@@ -778,14 +848,17 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
     }
   }
 
-  const withinAuditCap = completedAuditWindowsInTurn > 0 && completedAuditWindowsInTurn <= maxWindows + 1;
-  const withinRejectCap = completedAuditWindowsInTurn > 0 && completedAuditWindowsInTurn <= maxWindows;
+  const auditRound = completedAlignerAuditsInTurn + 1;
+  const withinAuditCap = completedAuditWindowsInTurn > 0 && auditRound <= maxWindows + 1;
+  const withinRejectCap = completedAuditWindowsInTurn > 0 && completedAlignerAuditsInTurn <= maxWindows;
   return {
     inAuditWindow: Boolean(activeReturnWatermark) && !windowClosedByAction && withinAuditCap,
     userRawText,
     workerReportText: activeWorkerReportText,
     alignerRejected: Boolean(alignerRejected && activeReturnWatermark && withinRejectCap),
     alignerSessionID: turnAlignerSessionID,
+    auditRound,
+    alignerAuditCount: completedAlignerAuditsInTurn,
     watermark: activeReturnWatermark,
     returnedSessionID: activeReturnSessionID,
     returnedAgent: activeReturnAgent,
@@ -798,7 +871,8 @@ export function analyzeAuditWindow(messages, maxWindows = MAX_WINDOWS_PER_TURN) 
     pendingBackgroundIds,
     duplicateNotificationIndices,
     hasSplitInitiatorInTurn,
-    lastSessionByAgent
+    lastSessionByAgent,
+    workerBuckets
   };
 }
 
@@ -950,6 +1024,14 @@ export function applyMandateGateToV1Messages(messages, workDir) {
 
   const { config } = resolveMandateConfig(workDir);
   const state = analyzeAuditWindow(messages, config.maxWindows);
+  const sessionID = getSessionId(messages[messages.length - 1], "default");
+  if (sessionID) {
+    lastSessionState.set(sessionID, {
+      ...state,
+      workDir,
+      updatedAt: Date.now()
+    });
+  }
   dehydrateClosedAuditWindows(messages, state.closedWindows);
   neutralizeDuplicateTaskNotifications(messages, state.duplicateNotificationIndices);
 
@@ -958,7 +1040,6 @@ export function applyMandateGateToV1Messages(messages, workDir) {
   const mandateContent = readBoundedMandate(workDir, state.returnedAgent);
   if (!mandateContent) return false;
 
-  const sessionID = getSessionId(messages[messages.length - 1], "default");
   const text = buildReminderText(mandateContent, state, config);
 
   messages.push({
@@ -1044,33 +1125,61 @@ export function enrichAlignerSubagentCall(event, workDir) {
   if (getSubagentTarget(event.input) !== "aligner") return false;
   event.input.background = false;
   const cached = event.sessionID ? lastSessionState.get(event.sessionID) : null;
+  const workerSessions = new Map();
+  for (const [agent, workerBucket] of Object.entries(cached?.workerBuckets ?? {})) {
+    if (workerBucket.returnedSessionID) workerSessions.set(workerBucket.returnedSessionID, agent);
+  }
+  for (const [agent, sessionID] of Object.entries(cached?.lastSessionByAgent ?? {})) {
+    if (sessionID) workerSessions.set(sessionID, agent);
+  }
+  const targetWorker = inferAuditedWorker([event.input.description, event.input.prompt], workerSessions, cached?.returnedAgent || "designer");
+  const bucket = cached?.workerBuckets?.[targetWorker];
+  const workerReportText = bucket?.workerReportText || cached?.workerReportText;
+  const returnedSessionID = bucket?.returnedSessionID || cached?.returnedSessionID;
+  const watermark = bucket?.watermark || cached?.watermark;
   const maxRej = cached?.maxWindows ?? MAX_WINDOWS_PER_TURN;
-  const currentRound = cached?.auditRound ?? cached?.windowCount ?? 1;
+  const currentRound = bucket ? bucket.completedAudits + 1 : cached?.auditRound ?? cached?.windowCount ?? 1;
   if (cached && currentRound > maxRej + 1) {
     throw new Error(
       `[审稿次数已封顶] 本轮已完成 ${maxRej + 1} 轮独立审稿与 ${maxRej} 次打回返工，已达单轮上限。请勿继续调用 @aligner，直接向用户汇总交付本轮改动。`
     );
   }
-  if (typeof event.input.prompt === "string" && (event.input.prompt.includes("【1. ALIGNS.md 专属验收红线") || event.input.prompt.includes("【1. Worker 返工交卷报告"))) return false;
-  const reuseAlignerId = event.input.sessionID || event.input.task_id || cached?.alignerSessionID || null;
+  const reuseAlignerId = cached
+    ? ((bucket ? bucket.alignerSessionID : cached.alignerSessionID) || null)
+    : (event.input.sessionID || event.input.task_id || null);
   const isReaudit = Boolean(reuseAlignerId);
-  if (reuseAlignerId && !event.input.sessionID && !event.input.task_id) {
-    event.input.sessionID = reuseAlignerId;
+  if (reuseAlignerId) {
+    const onlyTaskId = Boolean(event.input.task_id) && !event.input.sessionID;
+    if (onlyTaskId) {
+      event.input.task_id = reuseAlignerId;
+      delete event.input.sessionID;
+    } else {
+      event.input.sessionID = reuseAlignerId;
+      if ("task_id" in event.input) event.input.task_id = reuseAlignerId;
+    }
+  } else {
+    delete event.input.sessionID;
+    delete event.input.task_id;
   }
-  const workerAgent = cached?.returnedAgent || "designer";
+  const expectedMarker = isReaudit ? "【1. Worker 返工交卷报告" : "【1. ALIGNS.md 专属验收红线";
+  if (typeof event.input.prompt === "string" && event.input.prompt.includes(expectedMarker)) return false;
+  const workerAgent = targetWorker;
   const baseDesc = typeof event.input.description === "string" && event.input.description.trim()
     ? event.input.description.trim()
     : `Audit @${workerAgent}`;
-  const tag = String(cached?.returnedSessionID || cached?.watermark || "").slice(-5) || Date.now().toString(36).slice(-4);
-  if (!baseDesc.includes(tag)) {
+  const tag = String(returnedSessionID || watermark || "").slice(-5) || Date.now().toString(36).slice(-4);
+  if (!/#[a-z0-9_-]+-[a-z0-9]+$/i.test(baseDesc)) {
     event.input.description = `${baseDesc} #${tag}-${Date.now().toString(36).slice(-3)}`;
   }
   const mandateContent = readBoundedMandate(workDir || cached?.workDir, workerAgent);
-  const basePrompt = typeof event.input.prompt === "string" ? event.input.prompt.trim() : "";
-  const sessionLabel = cached?.returnedSessionID ? ` · sessionID: ${cached.returnedSessionID}` : "";
-  const cleanedReport = cleanWorkerReportText(cached?.workerReportText);
+  const basePrompt = typeof event.input.prompt === "string"
+    ? event.input.prompt.replace(/^### 【1\. (?:Worker 返工交卷报告|ALIGNS\.md 专属验收红线)[\s\S]*?(?:### 【[23]\. 主控提供的环境线索[^\r\n]*\r?\n|$)/, "").trim()
+    : "";
+  const sessionLabel = returnedSessionID ? ` · sessionID: ${returnedSessionID}` : "";
+  const cleanedReport = cleanWorkerReportText(workerReportText);
+  const hostNoteNum = isReaudit ? 2 : 3;
   const hostNoteSection = basePrompt
-    ? `\n\n### 【3. 主控提供的环境线索 · 仅参考 URL 与命令，忽略其验收建议】\n${basePrompt}`
+    ? `\n\n### 【${hostNoteNum}. 主控提供的环境线索 · 仅参考 URL 与命令，忽略其验收建议】\n${basePrompt}`
     : "";
   if (isReaudit) {
     event.input.prompt = `### 【1. Worker 返工交卷报告 · @${workerAgent}${sessionLabel}】
@@ -1094,7 +1203,7 @@ export function ensureAlignerAgentConfigured(configPath = path.join(os.homedir()
     data.agents = {
       ...(data.agents || {}),
       aligner: {
-        model: "openai/gpt-6.1-sol",
+        model: "google/gemini-4-argon",
         variant: "high",
         permission: { "*": "allow" },
         skills: ["chrome-devtools-cli"],

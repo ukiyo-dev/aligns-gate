@@ -246,6 +246,70 @@ test("aligner calls receive the original user, worker report, role mandate, and 
   assert.equal(enrichAlignerSubagentCall({ tool: "task", input: { agent: "fixer" } }, dir), false);
 });
 
+test("aligner descriptions containing the worker tag still receive one unique suffix", () => {
+  const messages = [user(), dispatch("ses_worker_SbdHY", false)];
+  const sessionID = "ses_description_suffix_parent";
+  assert.equal(applyMandateGateToV2Event({ sessionID, messages }, dir), true);
+  assert.match(messages.at(-1).content[0].text, /description="Audit @fixer SbdHY-1"/);
+  for (const tool of ["subagent", "task"]) {
+    const event = { tool, sessionID, input: { agent: "aligner", description: "Audit @fixer SbdHY-1" } };
+    assert.equal(enrichAlignerSubagentCall(event, dir), true);
+    assert.match(event.input.description, /^Audit @fixer SbdHY-1 #SbdHY-[a-z0-9]+$/i);
+    const description = event.input.description;
+    // Exercise the suffix check again without the enriched-prompt early return.
+    event.input.prompt = "Run tests";
+    assert.equal(enrichAlignerSubagentCall(event, dir), true);
+    assert.equal(event.input.description, description);
+  }
+});
+
+test("failed aligner calls preserve the first audit window without stale reviewer sessions", () => {
+  const failures = [
+    { status: "error" },
+    { state: { status: "error" } },
+    { isError: true },
+    { state: { error: "Dispatch failed" } },
+    { error: "Dispatch failed" }
+  ];
+  for (const tool of ["subagent", "task"]) {
+    for (const type of ["tool", "tool-call", "tool-result"]) {
+      for (const failure of failures) {
+        const input = { agent: "aligner", background: false, sessionID: "ses_oldAligner" };
+        const failedPart = {
+          type, tool, toolName: tool, id: "failed_audit", toolCallId: "failed_audit",
+          input, args: input, output: "Dispatch failed", ...failure,
+          state: { input, ...failure.state }
+        };
+        const messages = [user(), dispatch("ses_failed_audit_worker"), completion("ses_failed_audit_worker")];
+        const original = analyzeAuditWindow(messages);
+        messages.push({ role: "assistant", content: [failedPart] });
+        const state = analyzeAuditWindow(messages);
+        assert.equal(state.inAuditWindow, true);
+        assert.equal(state.auditRound, 1);
+        assert.equal(state.alignerAuditCount, 0);
+        assert.equal(state.alignerSessionID, null);
+        assert.deepEqual(state.closedWindows, original.closedWindows);
+        assert.deepEqual(state.returnedSessionsSinceDispatch, original.returnedSessionsSinceDispatch);
+        messages.push(completion("ses_failed_audit_worker", "duplicate_after_error"));
+        assert.deepEqual(analyzeAuditWindow(messages).duplicateNotificationIndices, [4]);
+      }
+    }
+  }
+});
+
+test("failed worker dispatches do not overwrite launch or agent tracking", () => {
+  const messages = [user(), dispatch("ses_failed_launch_worker"), completion("ses_failed_launch_worker")];
+  const failed = dispatch("ses_failed_launch_worker");
+  failed.content[0].state.status = "error";
+  failed.content[0].state.input.agent = "designer";
+  messages.push(failed);
+  const state = analyzeAuditWindow(messages);
+  assert.equal(state.returnedAgent, "fixer");
+  assert.equal(state.lastSessionByAgent.designer, null);
+  assert.equal(state.lastSessionByAgent.fixer, "ses_failed_launch_worker");
+  assert.equal(state.inAuditWindow, true);
+});
+
 function alignerMessages(verdict, format) {
   const messages = [user(), dispatch("ses_original_worker", false)];
   const input = { agent: "aligner", background: false, sessionID: "ses_reviewer" };
@@ -288,13 +352,14 @@ test("aligner reuses its session within a turn and starts fresh across turns", (
   assert.equal(applyMandateGateToV2Event(event, dir), true);
   assert.match(messages.at(-1).content[0].text, /2\/5/);
   assert.match(messages.at(-1).content[0].text, /sessionID="ses_aligner_r1"/);
-  const second = { tool: "subagent", sessionID: event.sessionID, input: { agent: "aligner", prompt: "Run npm test" } };
+  const second = { tool: "subagent", sessionID: event.sessionID, input: { agent: "aligner", sessionID: "ses_wrong", task_id: "ses_wrong", prompt: "Run npm test" } };
   assert.equal(enrichAlignerSubagentCall(second, dir), true);
   assert.equal(second.input.sessionID, "ses_aligner_r1");
+  assert.equal(second.input.task_id, "ses_aligner_r1");
   assert.match(second.input.prompt, /【1\. Worker 返工交卷报告/);
   assert.match(second.input.prompt, /Reworked implementation/);
-  assert.match(second.input.prompt, /Run npm test/);
-  assert.doesNotMatch(second.input.prompt, /【1\. ALIGNS\.md|Review the implementation against user intent/);
+  assert.match(second.input.prompt, /### 【2\. 主控提供的环境线索[\s\S]*Run npm test/);
+  assert.doesNotMatch(second.input.prompt, /### 【3\. 主控提供的环境线索|【1\. ALIGNS\.md|Review the implementation against user intent/);
   const enriched = second.input.prompt;
   assert.equal(enrichAlignerSubagentCall(second, dir), false);
   assert.equal(second.input.prompt, enriched);
@@ -304,12 +369,145 @@ test("aligner reuses its session within a turn and starts fresh across turns", (
   state = analyzeAuditWindow(messages);
   assert.equal(state.alignerSessionID, null);
   assert.equal(state.windowCount, 1);
+  assert.equal(state.auditRound, 1);
   assert.equal(applyMandateGateToV2Event(event, dir), true);
-  const next = { tool: "subagent", sessionID: event.sessionID, input: { agent: "aligner" } };
+  const next = { tool: "subagent", sessionID: event.sessionID, input: { agent: "aligner", sessionID: "ses_aligner_r1", task_id: "ses_aligner_r1", prompt: enriched } };
   assert.equal(enrichAlignerSubagentCall(next, dir), true);
   assert.equal(next.input.sessionID, undefined);
+  assert.equal(next.input.task_id, undefined);
   assert.match(next.input.prompt, /【1\. ALIGNS\.md 专属验收红线/);
+  assert.match(next.input.prompt, /### 【2\. Worker 改动声明/);
+  assert.match(next.input.prompt, /### 【3\. 主控提供的环境线索[\s\S]*Run npm test/);
+  assert.doesNotMatch(next.input.prompt, /【1\. Worker 返工交卷报告|### 【2\. 主控提供的环境线索/);
+
+  stripMandateGate(messages);
+  messages.push({ role: "assistant", content: [{ type: "tool-call", toolName: "subagent", toolCallId: "pass_audit", args: { agent: "aligner" } }] });
+  messages.push({ role: "tool", content: [{ type: "tool-result", toolName: "subagent", toolCallId: "pass_audit", output: "sessionID: ses_aligner_pass\n[ALIGN_PASS] All good" }] });
+  messages.push(dispatch("ses_followup_worker", false));
+  state = analyzeAuditWindow(messages);
+  assert.equal(state.alignerSessionID, null);
+  assert.equal(state.auditRound, 1);
+  assert.equal(applyMandateGateToV2Event(event, dir), true);
+  const afterPass = { tool: "subagent", sessionID: event.sessionID, input: { agent: "aligner", sessionID: "ses_aligner_pass" } };
+  assert.equal(enrichAlignerSubagentCall(afterPass, dir), true);
+  assert.equal(afterPass.input.sessionID, undefined);
+  assert.match(afterPass.input.prompt, /【1\. ALIGNS\.md 专属验收红线/);
   assert.equal(analyzeAuditWindow([]).alignerSessionID, null);
+});
+
+test("parallel workers keep independent audit sessions, rounds, reports, and rework loops", () => {
+  const scopedDir = path.join(dir, "parallel-workers");
+  fs.mkdirSync(scopedDir);
+  fs.writeFileSync(path.join(scopedDir, "ALIGNS.md"), "## @fixer\nFixer-only rule\n## @designer\nDesigner-only rule");
+  const scenarios = ["foreground", "notification", "completed-job"].flatMap((format) =>
+    ["v1", "v2", "notification"].map((auditFormat) => ({ format, auditFormat })));
+  for (const { format, auditFormat } of scenarios) {
+    const sessionID = `ses_parallel_${format}_${auditFormat}`;
+    const messages = [user()];
+    const launch = (agent) => {
+      const msg = dispatch(`ses_parallel_${agent}`);
+      msg.content[0].state.input.agent = agent;
+      messages.push(msg);
+    };
+    const finish = (agent, round) => {
+      const workerID = `ses_parallel_${agent}`;
+      const report = `${agent} report round ${round}`;
+      if (format === "foreground") {
+        const msg = dispatch(workerID, false);
+        msg.content[0].id = `${agent}_${round}`;
+        msg.content[0].state.input.agent = agent;
+        msg.content[0].state.output += `\n${report}`;
+        messages.push(msg);
+      } else if (format === "notification") {
+        const msg = completion(workerID, `${agent}_${round}`);
+        msg.content[0].text = msg.content[0].text.replace("Done", report);
+        messages.push(msg);
+      } else {
+        messages.push({ role: "user", metadata: { source: "subagent" }, content: [{
+          type: "text", text: `<completed-job> @${agent}\ntask: ${workerID}\n${report}\n</completed-job>`
+        }] });
+      }
+    };
+    const enrich = (agent) => {
+      // Transform a copy: dehydration must not remove history from this fixture.
+      applyMandateGateToV2Event({ sessionID, messages: structuredClone(messages) }, scopedDir);
+      const event = { tool: "subagent", sessionID, input: {
+        agent: "aligner", description: `Audit @${agent}`, sessionID: "ses_stale_reviewer"
+      } };
+      assert.equal(enrichAlignerSubagentCall(event, scopedDir), true);
+      return event;
+    };
+    const audit = (agent, round, verdict) => {
+      const event = enrich(agent);
+      const expectedSession = `ses_aligner_${agent}`;
+      if (round === 1) {
+        assert.equal(event.input.sessionID, undefined);
+        assert.match(event.input.prompt, new RegExp(`【1\\. ALIGNS\\.md 专属验收红线 · @${agent}】`));
+        assert.ok(event.input.prompt.includes(agent === "fixer" ? "Fixer-only rule" : "Designer-only rule"));
+        assert.ok(!event.input.prompt.includes(agent === "fixer" ? "Designer-only rule" : "Fixer-only rule"));
+      } else {
+        assert.equal(event.input.sessionID, expectedSession);
+        assert.match(event.input.prompt, new RegExp(`【1\\. Worker 返工交卷报告 · @${agent}`));
+      }
+      assert.ok(event.input.prompt.includes(`${agent} report round ${round}`));
+      assert.ok(!event.input.prompt.includes(`${agent === "fixer" ? "designer" : "fixer"} report`));
+      const callID = `audit_${agent}_${round}`;
+      if (auditFormat === "v1") {
+        messages.push({ role: "assistant", content: [{ type: "tool", tool: "subagent", id: callID,
+          state: { status: "completed", input: event.input, output: `sessionID: ${expectedSession}\n${verdict}` } }] });
+      } else {
+        messages.push({ role: "assistant", content: [{ type: "tool-call", toolName: "subagent", toolCallId: callID, args: event.input }] });
+        if (auditFormat === "v2") {
+          messages.push({ role: "tool", content: [{ type: "tool-result", toolName: "subagent", toolCallId: callID, output: `sessionID: ${expectedSession}\n${verdict}` }] });
+        } else {
+          const notice = completion(expectedSession, callID, "subagent");
+          notice.metadata = { agent: "aligner" };
+          notice.content[0].text = notice.content[0].text.replace("Done", `Audit @${agent}\n${verdict}`);
+          messages.push(notice);
+        }
+      }
+    };
+
+    launch("fixer");
+    launch("designer");
+    finish("fixer", 1);
+    audit("fixer", 1, "[ALIGN_POLISH]");
+    launch("fixer");
+    finish("designer", 1);
+    let state = analyzeAuditWindow(messages);
+    assert.equal(state.returnedAgent, "designer");
+    assert.equal(state.auditRound, 1);
+    assert.equal(state.alignerSessionID, null);
+    assert.equal(state.workerBuckets.fixer.inReworkLoop, true);
+    audit("designer", 1, "[ALIGN_POLISH]");
+    finish("fixer", 2);
+    state = analyzeAuditWindow(messages);
+    assert.equal(state.inAuditWindow, true);
+    assert.equal(state.auditRound, 2);
+    // Rework for a different worker must not close fixer's pending audit.
+    const originalClosedWindows = state.closedWindows;
+    launch("designer");
+    state = analyzeAuditWindow(messages);
+    assert.equal(state.inAuditWindow, true);
+    assert.equal(state.returnedAgent, "fixer");
+    assert.deepEqual(state.closedWindows, originalClosedWindows);
+    audit("fixer", 2, "[ALIGN_PASS]");
+    state = analyzeAuditWindow(messages);
+    assert.equal(state.workerBuckets.fixer.inReworkLoop, false);
+    assert.equal(state.workerBuckets.designer.inReworkLoop, true);
+    finish("designer", 2);
+    state = analyzeAuditWindow(messages);
+    assert.equal(state.returnedAgent, "designer");
+    assert.equal(state.auditRound, 2);
+    assert.equal(state.alignerSessionID, "ses_aligner_designer");
+    assert.equal(state.alignerAuditCount, 1);
+    // An explicit non-active target still receives its own bucket's dossier.
+    const fixerAudit = enrich("fixer");
+    assert.equal(fixerAudit.input.sessionID, "ses_aligner_fixer");
+    assert.match(fixerAudit.input.prompt, /fixer report round 2/);
+    assert.doesNotMatch(fixerAudit.input.prompt, /designer report/);
+    audit("designer", 2, "[ALIGN_PASS]");
+  }
 });
 
 test("aligner session tracking supports text returns, input, metadata, and output IDs", () => {
@@ -385,14 +583,21 @@ test("aligner dossier strips outer subagent/task tags while preserving full work
     for (const reaudit of [false, true]) {
       const notice = completion("ses_clean_worker", `clean_${tag}_${reaudit}`, tag);
       notice.content[0].text = notice.content[0].text.replace("Done", "Implemented behavior\n### 验证结果\nRan pnpm test");
-      const messages = [user(), dispatch("ses_clean_worker"), notice];
+      const messages = [user()];
+      if (reaudit) {
+        messages.push(...alignerMessages("sessionID: ses_clean_aligner\n[ALIGN_REJECT] Fix it", "v1").slice(1));
+      }
+      messages.push(dispatch("ses_clean_worker"), notice);
       const parent = `ses_clean_${tag}_${reaudit}`;
       assert.equal(applyMandateGateToV2Event({ sessionID: parent, messages }, dir), true);
-      const event = { tool: "subagent", sessionID: parent, input: { agent: "aligner", ...(reaudit ? { sessionID: "ses_clean_aligner" } : {}) } };
+      const event = { tool: "subagent", sessionID: parent, input: { agent: "aligner" } };
       assert.equal(enrichAlignerSubagentCall(event, dir), true);
       assert.match(event.input.prompt, /Implemented behavior\n### 验证结果\nRan pnpm test/);
       assert.doesNotMatch(event.input.prompt, /<\/?(?:task|subagent)\b/);
-      if (reaudit) assert.match(event.input.prompt, /未达标项或打磨建议/);
+      if (reaudit) {
+        assert.equal(event.input.sessionID, "ses_clean_aligner");
+        assert.match(event.input.prompt, /未达标项或打磨建议/);
+      }
     }
   }
 });
